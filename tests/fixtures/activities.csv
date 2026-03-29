@@ -1,0 +1,15 @@
+pid,seq,act,zone,start,end
+cmap_pid_a,1,home,urban,0,480
+cmap_pid_a,2,work,urban,480,960
+cmap_pid_a,3,home,urban,960,1440
+cmap_pid_b,1,home,suburban,0,360
+cmap_pid_b,2,work,suburban,360,600
+cmap_pid_b,3,shop,suburban,600,660
+cmap_pid_b,4,escort,suburban,660,720
+cmap_pid_b,5,leisure,suburban,720,840
+cmap_pid_b,6,medical,urban,840,900
+cmap_pid_b,7,visit,suburban,900,1020
+cmap_pid_b,8,education,suburban,1020,1080
+cmap_pid_b,9,other,suburban,1080,1140
+cmap_pid_b,10,home,suburban,1140,1440
+ktdb_pid_c,1,home,unknown,0,1440

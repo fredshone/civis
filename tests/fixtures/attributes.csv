@@ -1,0 +1,4 @@
+hid,pid,age,hh_size,hh_income,sex,dwelling,ownership,vehicles,disability,education,can_wfh,occupation,race,has_licence,relationship,employment,country,source,year,month,day,hh_zone,weight,access_egress_distance,max_temp_c,rain,avg_speed
+cmap_hh_01,cmap_pid_a,35,2,75000,female,house,owned,1,no,degree,yes,professional,white,yes,self,employed,usa,cmap,2017,10,tuesday,urban,1.2,,18.5,false,15.3
+cmap_hh_02,cmap_pid_b,28,4,55000,male,flat,rented,0,no,school,no,clerical,multiracial,yes,partner,employed,usa,cmap,2017,10,wednesday,suburban,0.9,1.25,14.2,true,8.7
+ktdb_hh_03,ktdb_pid_c,72,1,0,female,house,,0,,,,,,yes,,retired,south korea,ktdb,2021,10,friday,,1.0,,10.1,false,0.0
