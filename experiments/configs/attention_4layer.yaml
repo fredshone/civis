@@ -1,0 +1,19 @@
+name: attention_4layer
+seed: 42
+output_dir: outputs
+
+model:
+  architecture: attention
+  d_embed: 64
+  d_model: 128
+  dropout: 0.1
+  n_heads: 4
+  n_layers: 4
+  use_cls_token: true
+  pooling: cls
+
+training:
+  loss_name: distance_regression
+  lr: 5.0e-4
+  max_epochs: 100
+  warmup_steps: 2000

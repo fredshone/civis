@@ -1,0 +1,19 @@
+name: film
+seed: 42
+output_dir: outputs
+
+model:
+  architecture: film
+  d_embed: 64
+  d_model: 128
+  dropout: 0.1
+  context_attributes:
+    - source
+    - country
+    - year
+
+training:
+  loss_name: distance_regression
+  lr: 1.0e-3
+  max_epochs: 100
+  warmup_steps: 1000

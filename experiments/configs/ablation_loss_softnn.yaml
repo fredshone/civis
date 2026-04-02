@@ -1,0 +1,21 @@
+name: ablation_loss_softnn
+seed: 42
+output_dir: outputs
+
+data:
+  mode: single
+
+model:
+  architecture: addition
+  d_embed: 64
+  d_model: 128
+
+training:
+  loss_name: soft_nearest_neighbour
+  loss_kwargs:
+    tau_schedule: 0.5
+    tau_embed: 0.5
+    learnable_tau: true
+  lr: 1.0e-3
+  max_epochs: 100
+  warmup_steps: 1000

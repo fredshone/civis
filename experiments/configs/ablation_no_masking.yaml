@@ -1,0 +1,17 @@
+name: ablation_no_masking
+seed: 42
+output_dir: outputs
+
+data:
+  masking_base_rate: 0.0
+
+model:
+  architecture: addition
+  d_embed: 64
+  d_model: 128
+
+training:
+  loss_name: distance_regression
+  lr: 1.0e-3
+  max_epochs: 100
+  warmup_steps: 1000

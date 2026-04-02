@@ -1,0 +1,16 @@
+name: ablation_loss_regression
+seed: 42
+output_dir: outputs
+
+model:
+  architecture: addition
+  d_embed: 64
+  d_model: 128
+
+training:
+  loss_name: distance_regression
+  loss_kwargs:
+    use_huber: false
+  lr: 1.0e-3
+  max_epochs: 100
+  warmup_steps: 1000
