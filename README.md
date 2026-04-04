@@ -1,103 +1,460 @@
 # civis
 
-Attribute Embedding Learning for Human Activity Schedules.
+Attribute Embedding Learning for Human Activity Schedules: scalable contrastive learning with schedule-distance supervision.
 
-## distances.data
+## Quick Start
 
-Loading and array extraction for activity schedule data.
+```bash
+# Install
+uv sync
+
+# Run an experiment
+uv run civis run experiments/configs/baseline_addition.yaml
+
+# Run validation
+uv run pytest tests/
+
+# Ablation sweeps
+uv run civis ablate experiments/configs/attention_2layer.yaml --seeds 3
+```
+
+---
+
+## Architecture Overview: Distances, Features, and Metrics
+
+All distance metrics use a **scalable V2 API** with three phases:
+
+1. **Feature Extraction**: `prepare_features(activities) → dict`  
+    Precompute and cache participation vectors, sequence 2-gram vectors, and time-use matrices once.
+
+2. **Candidate Index** (optional): `build_candidate_index(features) → index`  
+   Build approximate nearest-neighbor index for large datasets (O(N log N) construction, not O(N²)).
+
+3. **Batch Scoring**: `score_pairs_batch(features, pairs, index) → distances`  
+   Score pairs in efficient vectorized batches without materializing full N×N matrix.
+
+This enables scaling without materialising dense distance matrices. On the
+lazy composite path, pair scoring can run on CUDA when available via
+``data.distance_device: cuda``.
+
+---
+
+## distances Module: Schedule Distance Metrics
+
+### Precomputing and Caching Features
+
+Features are versioned by content hash and can be reused across multiple distance metrics:
 
 ```python
-from distances.data import (
-    load_activities, load_attributes,
-    participation_matrix, time_use_matrix, activity_sequences,
+from distances import build_schedule_features, load_schedule_features
+
+# First run: extract and cache
+features = build_schedule_features(
+    activities_df,
+    feature_dir="cache/features",
+    timing_resolution=1,  # per-minute
+    overwrite=False,      # reuse if exists
 )
 
-acts  = load_activities("data/activities.csv")
-attrs = load_attributes("data/attributes.csv")
-
-# (N, 9) float64 — fraction of day spent in each activity type, rows sum to 1
-pids, part = participation_matrix(acts)
-
-# (N, 144) int32 — majority activity-type index per 10-min bin (default)
-pids, tuse = time_use_matrix(acts)
-pids, tuse = time_use_matrix(acts, resolution=5)   # (N, 288) bins
-
-# list of ordered activity-type string lists
-pids, seqs = activity_sequences(acts)
+# Later runs: auto-loads from cache
+features = load_schedule_features("cache/features")
+print(f"Extracted {len(features.pids)} schedules")
+print(f"Data version: {features.manifest.data_hash[:8]}...")
 ```
 
-Activity types are indexed by `ACTIVITY_TYPES`:
-`home, work, education, leisure, medical, escort, other, visit, shop`.
+**Cached artifacts**:
+- `features.npz`: Compressed NumPy archive (pids, participation matrix, timing matrix)
+- `sequences.json`: Ordered activity sequences
+- `manifest.json`: Metadata (content hash, schema, extraction time)
 
-For exploration, `python -m distances.data [activities.csv] [attributes.csv]`
-prints summary statistics.
+### Distance Scoring Approach
 
-## distances.sequence
+The training pipeline always uses lazy pairwise composite scoring with three
+components: participation, sequence 2-gram, and timing. The scorer is
+available as both ``CompositeDistance`` and ``GPUCompositeDistance``.
 
-Normalised edit distance between activity-type sequences.
+### Composite Distance: Weighted Combination
 
-```python
-from distances.sequence import edit_distance, pairwise_sequence_distance, DEFAULT_COST_MATRIX
-
-# Unit costs (every substitution = 1, normalised by max sequence length)
-d = edit_distance(["home", "work", "home"], ["home", "education", "leisure", "home"])
-
-# Semantic costs — work↔education, leisure↔visit, etc. cost 0.5
-d = edit_distance(seq1, seq2, cost_matrix=DEFAULT_COST_MATRIX)
-
-# Pairwise matrix for a list of sequences (parallelised with joblib)
-D = pairwise_sequence_distance(sequences, cost_matrix=DEFAULT_COST_MATRIX, n_jobs=-1)
-```
-
-## distances.timing
-
-Timing distances capturing *when* activities happen.
+Combine participation, sequence, and timing distances:
 
 ```python
-from distances.timing import (
-    timing_distance, activity_timing_distance,
-    pairwise_timing_distance, pairwise_activity_timing_distance,
+from distances.metric_plugins import CompositeDistance, ParticipationDistance, TwoGramDistance, TimingDistance
+
+# Build individual metrics
+part_metric = ParticipationDistance()
+seq_metric = TwoGramDistance()
+timing_metric = TimingMetric(resolution=10)
+
+# Composite with weights
+composite = CompositeDistance(
+    components=[part_metric, seq_metric, timing_metric],
+    weights=(0.33, 0.33, 0.34),
+    normalize_weights=True,
 )
-from distances.data import time_use_matrix
 
-# (N, 1440) int32 — majority activity-type index per minute
-pids, tuse = time_use_matrix(acts, resolution=1)
+# Extract features (once)
+features = composite.prepare_features(activities_df)
 
-# Hamming: fraction of minutes that disagree, in [0, 1]
-d = timing_distance(tuse[0], tuse[1])
-D = pairwise_timing_distance(tuse)
-
-# Wasserstein: earth-mover distance for one activity type's daily timing
-d = activity_timing_distance(tuse[0], tuse[1], activity_type_idx=1)  # 1 = work
-D = pairwise_activity_timing_distance(tuse, activity_type_idx=1, n_jobs=-1)
+# Score pairs in batch
+pairs = np.array([[0, 1], [0, 2], [1, 2]], dtype=np.int32)
+distances = composite.score_pairs_batch(features, pairs)
 ```
 
-## distances.composite
+### Metric Plugin Registry
 
-Weighted combination of all three distance components.
+Extend or customize distance metrics via the registry:
 
 ```python
-from distances.composite import composite_distance, pairwise_composite_distance
+from distances import build_metric
 
-# Scalar composite for a single pair
-d = composite_distance(part1, part2, seq1, seq2, time1, time2, weights=(1/3, 1/3, 1/3))
+# Built-in metrics: "participation", "sequence", "timing", "composite", "composite_gpu"
+metric = build_metric("participation")
 
-# Full pairwise matrix (parallelised; optional disk cache)
-pids, D = pairwise_composite_distance(
-    acts,
-    weights=(0.4, 0.3, 0.3),
-    n_jobs=-1,
-    cache_path="experiments/distances.npz",
+# Metrics may also expose a candidate index for approximate neighbour lookup
+features = metric.prepare_features(activities_df)
+index = metric.build_candidate_index(features)
+
+# Config-based composites
+metric = build_metric({
+    "name": "composite",
+    "weights": [0.4, 0.3, 0.3],
+    "components": ["participation", "sequence", "timing"]
+})
+
+```
+
+**Available Resolution Trade-offs**:
+- Timing resolution: `1` (per-minute, 1440 bins) = slow but precise
+- Timing resolution: `10` (default, 144 bins) = fast and practical
+- Timing resolution: `60` (hourly, 24 bins) = very fast, less precise
+
+**Candidate-index support**:
+- `ParticipationMetric` and `TimingMetric` build a lightweight k-NN index over their feature matrices.
+- `SequenceMetric` (2-gram vectors) also supports k-NN indexing.
+- `CompositeMetric` bundles any component indices that are available.
+
+---
+
+## datasets Module: PyTorch Datasets and Masking
+
+### Attribute Encoding
+
+```python
+from datasets.encoding import AttributeEncoder, default_attribute_configs
+
+encoder = AttributeEncoder(default_attribute_configs())
+encoder.fit(attributes_df)
+encoded_attrs = encoder.transform(attributes_df)
+
+# Output: dict[str, torch.Tensor]
+# - discrete: int64, values in [0, vocab_size]
+# - continuous: float32, normalized to [0, 1]
+```
+
+### Training Datasets with Distance Supervision
+
+```python
+from datasets.dataset import ScheduleEmbeddingDataset, SparseDistanceMatrix
+
+# Sparse storage (k-NN neighbors only)
+sparse_dist = SparseDistanceMatrix.from_dense(D, k=500)
+
+# Pairwise mode: (attrs_i, attrs_j, distance_ij)
+dataset = ScheduleEmbeddingDataset(
+    attributes=encoded_attrs,
+    distance_matrix=sparse_dist,
+    mode="pairwise",
+    sampling_strategy="random",  # or "hard_negative"
+)
+
+# Triplet mode: (anchor, positive, negative, d_ap, d_an)
+dataset = ScheduleEmbeddingDataset(
+    attributes=encoded_attrs,
+    distance_matrix=sparse_dist,
+    mode="triplet",
+    positive_threshold=0.2,
+    negative_threshold=0.5,
 )
 ```
 
-## datasets
+### Lazy Pairwise Backend (Large Data)
 
-PyTorch dataset and dataloader for contrastive training.
+Distances are computed lazily per sampled pair via
+metric plugin `score_pairs_batch`.
 
-### datasets.encoding
+On this backend, civis still precomputes and caches all schedule features in
+`<output>/<run>/feature_store/` and also persists a pair-distance memo cache to
+`<output>/<run>/lazy_distance_cache.npz` for reuse across reruns. When CUDA is
+available, the lazy scorer can move feature matrices to GPU with
+`data.distance_device: cuda`.
 
-Encodes raw attribute DataFrames into tensors.
+```yaml
+data:
+    mode: pairwise
+    distance_device: cuda
+    timing_resolution: 10
+    distance_weights: { participation: 0.33, sequence: 0.33, timing: 0.34 }
+```
+
+```bash
+# Built-in lazy config
+uv run civis run experiments/configs/attention_2layer_lazy.yaml
+
+# Same config with external data directory override
+uv run civis run experiments/configs/attention_2layer_lazy.yaml --data-dir /path/to/data
+```
+
+Notes:
+- Only `mode: pairwise` is supported.
+- Tune cache size with `data.lazy_max_cached_pairs`.
+- Use `data.distance_device: cuda` to enable GPU pair scoring when available.
+
+### Attribute Masking
+
+Three masking strategies for robustness:
+
+```python
+from datasets.masking import AttributeMasker
+
+masker = AttributeMasker.from_data(
+    attributes_df,
+    base_rate=0.15,
+    missingness_weighted=True,
+    strategy="curriculum",  # "independent", "grouped", or "curriculum"
+)
+
+# Apply during sampling (not preprocessing)
+masked_attrs = masker(attributes)
+```
+
+---
+
+## models Module: Embedding Models
+
+All embedders consume attribute dictionaries and output fixed-width embeddings:
+
+```python
+from models.addition import AdditionEmbedder
+from models.attention import SelfAttentionEmbedder
+from models.film import FiLMEmbedder
+
+model = SelfAttentionEmbedder(
+    attribute_configs=encoder.configs,
+    d_embed=64,
+    d_model=128,
+    n_heads=4,
+    n_layers=2,
+)
+
+# Forward pass
+embeddings = model(attributes)  # (B, 128)
+```
+
+**Model Types**:
+- `AdditionEmbedder`: Sum pool over attribute embeddings (baseline)
+- `SelfAttentionEmbedder`: Transformer encoder over attribute tokens (recommended)
+- `FiLMEmbedder`: FiLM conditioning for feature modulation
+
+---
+
+## training Module: Contrastive Learning
+
+PyTorch Lightning training with multiple loss functions:
+
+```python
+from training.losses import DistanceRegressionLoss, SoftNearestNeighbourLoss
+from training.trainer import EmbeddingTrainer, TrainerConfig
+
+config = TrainerConfig(
+    lr=1e-3,
+    max_epochs=100,
+    warmup_steps=1000,
+)
+
+trainer = EmbeddingTrainer(
+    model=model,
+    loss_fn=DistanceRegressionLoss(),
+    config=config,
+)
+```
+
+**Loss Functions**:
+- `DistanceRegressionLoss`: MSE between predicted and true squared distances
+- `SoftNearestNeighbourLoss`: Softmax over batch distances
+- `RankCorrelationLoss`: Spearman correlation preservation
+- `NTXent`: Contrastive NT-Xent loss
+
+**Optional Training Features**:
+- Hard negative mining with periodic k-NN index refresh
+- Curriculum attribute masking (increasing difficulty over time)
+- Collapse monitoring (prevent embedding space collapse)
+- Attention weight logging (for attention models)
+
+---
+
+## evaluation Module: Downstream and Intrinsic Tasks
+
+### Downstream Task Evaluation
+
+```python
+from evaluation.discrete import DiscreteDownstreamTask
+from evaluation.continuous import ContinuousDownstreamTask
+
+# Freeze embedder, train lightweight head on new task
+task = DiscreteDownstreamTask(
+    task_name="employment",
+    embedding_model=embedder,
+    attributes=val_attrs,
+    labels=val_labels,
+)
+
+metrics = task.run()
+# → {"linear/accuracy": 0.87, "mlp/auc": 0.92, ...}
+```
+
+### Intrinsic Embedding Geometry Analysis
+
+```python
+from evaluation.geometry import GeometryAnalyser
+
+analyser = GeometryAnalyser(embedder)
+report = analyser.full_report(
+    embeddings=val_emb,
+    distances=val_D,
+)
+
+# Returns: alignment, uniformity, rank correlation, neighbourhood overlap, source separation, CKA
+```
+
+---
+
+## experiments Module: Configuration and Orchestration
+
+### Running Experiments
+
+Config YAML structure:
+
+```yaml
+name: baseline_attention
+seed: 42
+
+data:
+  data_path: data/activities.parquet
+  attributes_path: data/attributes.parquet
+  distance_weights: { participation: 0.33, sequence: 0.33, timing: 0.34 }
+    mode: pairwise
+    timing_resolution: 10
+    lazy_max_cached_pairs: 500000
+
+model:
+  architecture: attention
+  d_embed: 64
+  d_model: 128
+
+training:
+  lr: 0.001
+  max_epochs: 100
+
+evaluation:
+  downstream_tasks: [employment, income, education]
+```
+
+```python
+from experiments.run import run_experiment
+
+run_experiment("experiments/configs/baseline_attention.yaml")
+```
+
+### Ablation Sweeps
+
+```bash
+uv run civis ablate experiments/configs/attention_2layer.yaml --seeds 3
+uv run civis ablate experiments/configs/baseline_addition.yaml --seeds 1
+```
+
+Generates comparison tables and figures in `experiments/results/`.
+
+---
+
+## CLI: main.py
+
+```bash
+# Run a single experiment
+uv run python main.py run experiments/configs/baseline_addition.yaml
+
+# Validate data and distances
+uv run python main.py validate data/activities.parquet data/attributes.parquet
+
+# Run ablation group
+uv run python main.py ablate --group architecture
+
+# Generate comparison report
+uv run python main.py report --ablation_dir experiments/ablations/architecture/
+```
+
+---
+
+## Data Format
+
+### activities.csv / activities.parquet
+
+Columns: `pid`, `seq`, `act`, `zone`, `start`, `end`
+- `pid` (Utf8): Person ID
+- `seq` (Int32): Activity sequence number (within person, 0-indexed)
+- `act` (Utf8): Activity type (one of 9 types)
+- `zone` (Utf8): Spatial zone
+- `start` (Int32): Minutes since midnight [0, 1440)
+- `end` (Int32): Minutes since midnight (0, 1440]
+
+### attributes.csv / attributes.parquet
+
+Columns: `pid`, `hid`, `age`, `hh_size`, `hh_income`, `sex`, `dwelling`, `ownership`, `vehicles`, `disability`, `education`, `can_wfh`, `occupation`, `race`, `has_licence`, `relationship`, `employment`, `country`, `source`, `year`, `month`, `day`, `hh_zone`, `weight`, `access_egress_distance`, `max_temp_c`, `rain`, `avg_speed`
+- Discrete attributes mapped to integer indices (0 = unknown)
+- Continuous attributes normalized to [0, 1]
+
+---
+
+## Project Structure
+
+```
+civis/
+├── distances/          # Schedule distance metrics, features, caching
+├── datasets/          # PyTorch datasets, encoding, masking
+├── models/            # Embedding models (addition, attention, FiLM)
+├── training/          # Losses, PyTorch Lightning trainer
+├── evaluation/        # Downstream tasks, intrinsic geometry analysis
+├── experiments/       # Configs, ablations, reporting
+├── main.py            # CLI
+├── tests/             # Unit tests (pytest)
+└── data/              # Example datasets (not in repo)
+```
+
+---
+
+## Installation and Development
+
+```bash
+# Install dependencies
+uv sync
+
+# Run tests
+uv run pytest
+
+# Format code
+uv run ruff check --fix distances/ datasets/ models/ training/ evaluation/
+
+# Type check
+uv run pyright distances/
+```
+
+---
+
+## References
+
+**Contrastive Learning**: Spectral distribution alignment (Wang & Isola, ICLR 2021)  
+**Sequence 2-grams**: Normalized transition-vector distance over activity bigrams  
+**Wasserstein Timing**: 1D earth-mover distance for activity timing distributions  
+**Feature Hashing**: Content-addressable versioning for reproducibility
 
 ```python
 from distances.data import load_attributes
@@ -139,26 +496,26 @@ masker.set_step(training_step)
 
 ### datasets.dataset
 
-PyTorch Dataset yielding contrastive pairs or triplets.
+PyTorch Dataset yielding lazy pairwise contrastive samples.
 
 ```python
 import numpy as np
 from torch.utils.data import DataLoader
-from datasets.dataset import ScheduleEmbeddingDataset, SparseDistanceMatrix, collate_fn
+from datasets.dataset import LazyPairwiseDataset, collate_fn
+from distances.metric_plugins import CompositeDistance, ParticipationDistance, TwoGramDistance, TimingDistance
 
-# Precompute distances (from distances.composite)
-pids, D = pairwise_composite_distance(acts)
+metric = CompositeDistance(
+    components=[ParticipationDistance(), TwoGramDistance(), TimingDistance(resolution=10)],
+    weights=(0.33, 0.33, 0.34),
+)
+features = metric.prepare_features(acts)
 
-# For large datasets, compress to k nearest + k furthest neighbours per person
-sparse_D = SparseDistanceMatrix.from_dense(D, k=50)
-
-# Pairwise mode: yields (attrs_i, attrs_j, distance_ij)
-ds = ScheduleEmbeddingDataset(encoded, sparse_D, masker=masker, mode="pairwise")
-
-# Triplet mode: yields (anchor, positive, negative, d_ap, d_an)
-ds = ScheduleEmbeddingDataset(
-    encoded, sparse_D, masker=masker,
-    mode="triplet", positive_threshold=0.2, negative_threshold=0.5,
+ds = LazyPairwiseDataset(
+    attributes=encoded,
+    global_indices=np.arange(len(next(iter(encoded.values()))), dtype=np.int64),
+    metric=metric,
+    metric_features=features,
+    masker=masker,
 )
 
 dl = DataLoader(ds, batch_size=256, collate_fn=collate_fn, num_workers=4)
@@ -268,7 +625,7 @@ trainer = EmbeddingTrainer(model, loss_fn, cfg, val_pairs=(attrs_i, attrs_j, dis
 
 `EmbeddingTrainer` is a `LightningModule` with:
 - Cosine LR schedule with linear warmup
-- Validation metrics: alignment, uniformity, Spearman rank correlation (on fixed held-out pairs), neighbourhood overlap at k=5 and k=20
+- Validation metrics: alignment, uniformity, Spearman rank correlation (on fixed held-out pairs)
 - Periodic hard-negative k-NN index refresh
 - Curriculum masker step updates
 
@@ -469,13 +826,30 @@ generate_report("outputs/", "results/")
 generate_umap_from_dir("outputs/attention_2layer", "results/")
 ```
 
-`generate_umap_from_dir` loads `config.json`, `encoder.pkl`, `model.pt`, and `distance_matrix.npy` saved automatically by the training runner and generates three figures under `results/figures/`:
+`generate_umap_from_dir` loads `config.json`, `encoder.pkl`, `model.pt`, and `distance_matrix.npz` saved automatically by the training runner and generates three figures under `results/figures/`:
 
 | Figure | Colour |
 |--------|--------|
 | `umap_source.png` | Data source |
 | `umap_employment.png` | Employment status |
 | `umap_schedule_cluster.png` | k-means clusters on schedule distance matrix |
+
+## CLI
+
+After `uv sync`, the `civis` command is available with three subcommands:
+
+```bash
+# Run a full training experiment from a YAML config
+civis run experiments/configs/baseline_addition.yaml
+
+# Validate data files and print summary statistics
+civis validate data/activities.parquet data/attributes.parquet
+
+# Run an ablation study from a base config
+civis ablate experiments/configs/baseline_addition.yaml
+```
+
+Each subcommand accepts `--help` for usage details.
 
 ## Reproducibility
 
@@ -487,8 +861,20 @@ DATA_DIR=/path/to/data bash scripts/reproduce.sh
 
 Optional environment variables: `OUTPUT_DIR` (default `outputs`), `RESULTS_DIR` (default `results`), `ABLATION_SEEDS` (default `3`), `BASE_CONFIG` (default `experiments/configs/attention_2layer.yaml`).
 
+To include the on-the-fly pairwise baseline in Step 1, set:
+
+```bash
+INCLUDE_LAZY_BASELINE=1 DATA_DIR=/path/to/data bash scripts/reproduce.sh
+```
+
 The script is idempotent — each stage is skipped if its outputs already exist, so interrupted runs resume cleanly.
 
 Dependency files:
 - `requirements.txt` — pinned pip packages (`uv export --no-hashes --no-dev`)
 - `environment.yml` — conda environment referencing `requirements.txt`
+
+To install with test dependencies: `uv sync --group dev`
+
+To run unit tests: `uv run pytest -m "not slow"`
+
+To run the end-to-end smoke test: `uv run pytest -m slow tests/test_smoke.py`

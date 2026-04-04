@@ -63,6 +63,13 @@ def build_model(config: dict[str, Any]) -> BaseAttributeEmbedder:
             f"Unknown architecture '{arch}'. Choose from: {list(MODEL_REGISTRY)}"
         )
     model_cls = MODEL_REGISTRY[arch]
+    # asdict() serialises AttributeConfig objects to plain dicts; reconstruct them.
+    if "attribute_configs" in config:
+        from datasets.encoding import AttributeConfig as _AC
+        config["attribute_configs"] = [
+            _AC(**c) if isinstance(c, dict) else c
+            for c in config["attribute_configs"]
+        ]
     embedder_config = AttributeEmbedderConfig(**config)
     return model_cls(embedder_config)
 

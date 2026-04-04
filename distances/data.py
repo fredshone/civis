@@ -31,6 +31,8 @@ load_attributes(path) -> pl.DataFrame
 participation_matrix(activities) -> tuple[list[str], np.ndarray]
 time_use_matrix(activities, resolution) -> tuple[list[str], np.ndarray]
 activity_sequences(activities) -> tuple[list[str], list[list[str]]]
+sequence_2gram_matrix(activities) -> tuple[list[str], np.ndarray]
+sequence_2gram_matrix_from_sequences(sequences) -> np.ndarray
 print_summary(activities, attributes) -> None
 plot_schedules(activities, n, show) -> matplotlib.figure.Figure
 plot_activity_frequencies(activities, show) -> matplotlib.figure.Figure
@@ -59,15 +61,15 @@ ACTIVITY_TYPES: tuple[str, ...] = (
 _ACT_INDEX: dict[str, int] = {a: i for i, a in enumerate(ACTIVITY_TYPES)}
 
 _ACT_COLOURS: dict[str, str] = {
-    "home":      "#4e79a7",
-    "work":      "#f28e2b",
+    "home": "#4e79a7",
+    "work": "#f28e2b",
     "education": "#59a14f",
-    "leisure":   "#76b7b2",
-    "medical":   "#e15759",
-    "escort":    "#ff9da7",
-    "other":     "#b07aa1",
-    "visit":     "#edc948",
-    "shop":      "#9c755f",
+    "leisure": "#76b7b2",
+    "medical": "#e15759",
+    "escort": "#ff9da7",
+    "other": "#b07aa1",
+    "visit": "#edc948",
+    "shop": "#9c755f",
 }
 
 
@@ -77,80 +79,102 @@ _ACT_COLOURS: dict[str, str] = {
 
 
 def load_activities(path: str | Path) -> pl.DataFrame:
-    """Load an activities CSV and return a typed DataFrame.
+    """Load an activities CSV or Parquet file and return a typed DataFrame.
 
     Parameters
     ----------
     path:
-        Path to a CSV with columns: pid, seq, act, zone, start, end.
+        Path to a CSV or Parquet file with columns: pid, seq, act, zone, start, end.
 
     Returns
     -------
     pl.DataFrame
         pid (Utf8), seq (Int32), act (Utf8), zone (Utf8),
         start (Int32), end (Int32).
+
+    Raises
+    ------
+    ValueError
+        If the file extension is not .csv or .parquet.
     """
-    return pl.read_csv(
-        path,
-        schema_overrides={
-            "pid":   pl.Utf8,
-            "seq":   pl.Int32,
-            "act":   pl.Utf8,
-            "zone":  pl.Utf8,
-            "start": pl.Int32,
-            "end":   pl.Int32,
-        },
-    )
+    path = Path(path)
+    schema = {
+        "pid": pl.Utf8,
+        "seq": pl.Int32,
+        "act": pl.Utf8,
+        "zone": pl.Utf8,
+        "start": pl.Int32,
+        "end": pl.Int32,
+    }
+    if path.suffix == ".csv":
+        return pl.read_csv(path, schema_overrides=schema)
+    elif path.suffix == ".parquet":
+        return pl.read_parquet(path).cast(schema)
+    else:
+        raise ValueError(
+            f"Unsupported format: {path.suffix!r}. Expected .csv or .parquet"
+        )
 
 
 def load_attributes(path: str | Path) -> pl.DataFrame:
-    """Load an attributes CSV and return a typed DataFrame.
+    """Load an attributes CSV or Parquet file and return a typed DataFrame.
 
     Parameters
     ----------
     path:
-        Path to a CSV matching the foundata attributes schema.
+        Path to a CSV or Parquet file matching the foundata attributes schema.
 
     Returns
     -------
     pl.DataFrame
         String columns as Utf8; numeric columns cast where unambiguous.
-        Empty strings and ``"void"`` are treated as null.
+        Empty strings and ``"void"`` are treated as null (CSV only; Parquet
+        stores nulls natively).
+
+    Raises
+    ------
+    ValueError
+        If the file extension is not .csv or .parquet.
     """
-    return pl.read_csv(
-        path,
-        schema_overrides={
-            "hid":                    pl.Utf8,
-            "pid":                    pl.Utf8,
-            "age":                    pl.Int32,
-            "hh_size":                pl.Int32,
-            "hh_income":              pl.Float64,
-            "sex":                    pl.Utf8,
-            "dwelling":               pl.Utf8,
-            "ownership":              pl.Utf8,
-            "vehicles":               pl.Int32,
-            "disability":             pl.Utf8,
-            "education":              pl.Utf8,
-            "can_wfh":                pl.Utf8,
-            "occupation":             pl.Utf8,
-            "race":                   pl.Utf8,
-            "has_licence":            pl.Utf8,
-            "relationship":           pl.Utf8,
-            "employment":             pl.Utf8,
-            "country":                pl.Utf8,
-            "source":                 pl.Utf8,
-            "year":                   pl.Int32,
-            "month":                  pl.Utf8,
-            "day":                    pl.Utf8,
-            "hh_zone":                pl.Utf8,
-            "weight":                 pl.Float64,
-            "access_egress_distance": pl.Float64,
-            "max_temp_c":             pl.Float64,
-            "rain":                   pl.Utf8,
-            "avg_speed":              pl.Float64,
-        },
-        null_values=["", "void"],
-    )
+    path = Path(path)
+    schema = {
+        "hid": pl.Utf8,
+        "pid": pl.Utf8,
+        "age": pl.Int32,
+        "hh_size": pl.Int32,
+        "hh_income": pl.Float64,
+        "sex": pl.Utf8,
+        "dwelling": pl.Utf8,
+        "ownership": pl.Utf8,
+        "vehicles": pl.Int32,
+        "disability": pl.Utf8,
+        "education": pl.Utf8,
+        "can_wfh": pl.Utf8,
+        "occupation": pl.Utf8,
+        "race": pl.Utf8,
+        "has_licence": pl.Utf8,
+        "relationship": pl.Utf8,
+        "employment": pl.Utf8,
+        "country": pl.Utf8,
+        "source": pl.Utf8,
+        "year": pl.Int32,
+        "month": pl.Utf8,
+        "day": pl.Utf8,
+        "hh_zone": pl.Utf8,
+        "weight": pl.Float64,
+        "access_egress_distance": pl.Float64,
+        "max_temp_c": pl.Float64,
+        "rain": pl.Utf8,
+        "avg_speed": pl.Float64,
+    }
+    if path.suffix == ".csv":
+        return pl.read_csv(path, schema_overrides=schema, null_values=["", "void"])
+    elif path.suffix == ".parquet":
+        return pl.read_parquet(path).cast(schema)
+    else:
+        raise ValueError(
+            f"Unsupported format: {path.suffix!r}. Expected .csv or .parquet"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -177,9 +201,7 @@ def participation_matrix(
         1440 minutes spent in each activity type (indexed by
         ``ACTIVITY_TYPES``).  Each row sums to 1.0.
     """
-    df = activities.with_columns(
-        (pl.col("end") - pl.col("start")).alias("duration")
-    )
+    df = activities.with_columns((pl.col("end") - pl.col("start")).alias("duration"))
     agg_exprs = [
         pl.col("duration").filter(pl.col("act") == act).sum().alias(act)
         for act in ACTIVITY_TYPES
@@ -220,9 +242,7 @@ def time_use_matrix(
         for person ``pids[i]``.  Uncovered minutes default to index 0 (home).
     """
     if 1440 % resolution != 0:
-        raise ValueError(
-            f"resolution={resolution} does not divide 1440 exactly"
-        )
+        raise ValueError(f"resolution={resolution} does not divide 1440 exactly")
 
     pids: list[str] = activities["pid"].unique().sort().to_list()
     n = len(pids)
@@ -232,16 +252,15 @@ def time_use_matrix(
         {"act": list(ACTIVITY_TYPES), "_act_idx": list(range(len(ACTIVITY_TYPES)))}
     )
     enriched = (
-        activities
-        .join(pid_df, on="pid")
+        activities.join(pid_df, on="pid")
         .join(act_df, on="act", how="left")
         .with_columns(pl.col("_act_idx").fill_null(0))
         .select(["_pid_idx", "start", "end", "_act_idx"])
     )
 
     pid_indices = enriched["_pid_idx"].to_numpy()
-    starts      = enriched["start"].to_numpy()
-    ends        = enriched["end"].to_numpy()
+    starts = enriched["start"].to_numpy()
+    ends = enriched["end"].to_numpy()
     act_indices = enriched["_act_idx"].to_numpy()
 
     # Build at 1-minute resolution, then downsample
@@ -281,8 +300,7 @@ def activity_sequences(
         ``pids[i]``, sorted by start time.
     """
     grouped = (
-        activities
-        .sort(["pid", "start"])
+        activities.sort(["pid", "start"])
         .group_by("pid", maintain_order=True)
         .agg(pl.col("act"))
         .sort("pid")
@@ -290,6 +308,65 @@ def activity_sequences(
     pids: list[str] = grouped["pid"].to_list()
     seqs: list[list[str]] = grouped["act"].to_list()
     return pids, seqs
+
+
+def sequence_2gram_matrix_from_sequences(
+    sequences: list[list[str]],
+) -> np.ndarray:
+    """Normalised 2-gram transition vectors from activity sequences.
+
+    Parameters
+    ----------
+    sequences:
+        Ordered activity-type sequences per person.
+
+    Returns
+    -------
+    np.ndarray, shape (N, 81), float64
+        Row ``i`` contains the normalised counts of all activity 2-grams for
+        person ``i`` using the canonical ``ACTIVITY_TYPES × ACTIVITY_TYPES``
+        vocabulary in row-major order.
+    """
+    n = len(sequences)
+    n_acts = len(ACTIVITY_TYPES)
+    n_features = n_acts * n_acts
+    mat = np.zeros((n, n_features), dtype=np.float64)
+
+    for i, seq in enumerate(sequences):
+        if len(seq) < 2:
+            continue
+        for prev_act, next_act in zip(seq[:-1], seq[1:]):
+            prev_idx = _ACT_INDEX.get(prev_act)
+            next_idx = _ACT_INDEX.get(next_act)
+            if prev_idx is None or next_idx is None:
+                continue
+            feature_idx = prev_idx * n_acts + next_idx
+            mat[i, feature_idx] += 1.0
+
+    row_sums = mat.sum(axis=1, keepdims=True)
+    row_sums = np.where(row_sums == 0.0, 1.0, row_sums)
+    return mat / row_sums
+
+
+def sequence_2gram_matrix(
+    activities: pl.DataFrame,
+) -> tuple[list[str], np.ndarray]:
+    """Build per-person normalised 2-gram transition vectors.
+
+    Parameters
+    ----------
+    activities:
+        DataFrame as returned by :func:`load_activities`.
+
+    Returns
+    -------
+    pids : list[str]
+        Person IDs in sorted order, length N.
+    matrix : np.ndarray, shape (N, 81), float64
+        Normalised activity 2-gram vectors for each person.
+    """
+    pids, sequences = activity_sequences(activities)
+    return pids, sequence_2gram_matrix_from_sequences(sequences)
 
 
 # ---------------------------------------------------------------------------
@@ -303,9 +380,7 @@ def print_summary(activities: pl.DataFrame, attributes: pl.DataFrame) -> None:
     n_rows = len(activities)
     print(f"Activities: {n_rows:,} rows, {n_persons:,} persons")
 
-    seq_lengths = (
-        activities.group_by("pid").agg(pl.len().alias("n"))["n"]
-    )
+    seq_lengths = activities.group_by("pid").agg(pl.len().alias("n"))["n"]
     print(
         f"Sequence length: min={seq_lengths.min()}, "
         f"mean={seq_lengths.mean():.1f}, "
@@ -449,7 +524,9 @@ def plot_activity_frequencies(
                 .agg(pl.len().alias("count"))
                 .iter_rows(named=True)
             }
-            ax.bar(x + i * width, [counts_map.get(a, 0) for a in acts], width, label=src)
+            ax.bar(
+                x + i * width, [counts_map.get(a, 0) for a in acts], width, label=src
+            )
         ax.set_xticks(x + width * (len(sources) - 1) / 2)
         ax.set_xticklabels(acts, rotation=30, ha="right")
         ax.set_title("Activity type frequencies by source")
@@ -504,26 +581,3 @@ def plot_duration_distributions(
     if show:
         plt.show()
     return fig
-
-
-# ---------------------------------------------------------------------------
-# CLI entry point
-# ---------------------------------------------------------------------------
-
-if __name__ == "__main__":
-    import sys
-
-    activities_path = (
-        Path(sys.argv[1])
-        if len(sys.argv) > 1
-        else Path("~/Data/foundata/all/activities.csv").expanduser()
-    )
-    attributes_path = (
-        Path(sys.argv[2])
-        if len(sys.argv) > 2
-        else Path("~/Data/foundata/all/attributes.csv").expanduser()
-    )
-
-    acts_df = load_activities(activities_path)
-    attrs_df = load_attributes(attributes_path)
-    print_summary(acts_df, attrs_df)

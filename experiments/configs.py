@@ -19,9 +19,23 @@ from typing import Any
 import yaml
 
 
+def _normalise_distance_weights(
+    w: dict[str, float] | tuple[float, float, float],
+) -> tuple[float, float, float]:
+    """Convert dict form to canonical (participation, sequence, timing) tuple."""
+    if isinstance(w, tuple):
+        return w
+    required = ("participation", "sequence", "timing")
+    missing = [k for k in required if k not in w]
+    if missing:
+        raise ValueError(f"distance_weights missing keys: {missing}")
+    return (w["participation"], w["sequence"], w["timing"])
+
+
 # ---------------------------------------------------------------------------
 # Config dataclasses
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class DataConfig:
@@ -50,21 +64,31 @@ class DataConfig:
         Base attribute masking probability.
     masking_missingness_weighted:
         Scale per-attribute masking rate by empirical missingness.
-    positive_threshold:
-        Maximum schedule distance for a positive pair (triplet mode).
-    negative_threshold:
-        Minimum schedule distance for a negative pair (triplet mode).
-    sparse_k:
-        Neighbours retained per person in the sparse distance matrix.
+    timing_resolution:
+        Time-use bin size in minutes for timing distance components.
+    distance_device:
+        Requested device for lazy distance scoring.  CUDA is used when
+        available; otherwise the runner falls back to CPU.
+    lazy_max_cached_pairs:
+        Maximum number of lazily-computed schedule distances kept in the
+        in-memory on-the-fly cache before eviction.
+    lazy_distance_cache_file:
+        File name under the run output directory used to persist lazy
+        pair-distance cache across runs.
     val_pairs_seed:
         RNG seed for sampling fixed validation pairs.
     n_val_pairs:
         Number of fixed validation pairs for rank-correlation computation.
     """
+
     data_path: str = "data/activities.parquet"
     attributes_path: str = "data/attributes.parquet"
-    distance_weights: dict[str, float] = field(
-        default_factory=lambda: {"participation": 1 / 3, "sequence": 1 / 3, "timing": 1 / 3}
+    distance_weights: dict[str, float] | tuple[float, float, float] = field(
+        default_factory=lambda: {
+            "participation": 1 / 3,
+            "sequence": 1 / 3,
+            "timing": 1 / 3,
+        }
     )
     train_fraction: float = 0.8
     val_fraction: float = 0.1
@@ -74,11 +98,17 @@ class DataConfig:
     masking_strategy: str = "independent"
     masking_base_rate: float = 0.15
     masking_missingness_weighted: bool = True
-    positive_threshold: float = 0.2
-    negative_threshold: float = 0.5
-    sparse_k: int = 50
+    timing_resolution: int = 10
+    distance_device: str = "cuda"
+    lazy_max_cached_pairs: int = 500000
+    lazy_distance_cache_file: str = "lazy_distance_cache.npz"
     val_pairs_seed: int = 42
     n_val_pairs: int = 1000
+
+    def __post_init__(self):
+        self.distance_weights = _normalise_distance_weights(self.distance_weights)
+        if self.mode != "pairwise":
+            raise ValueError(f"Only mode='pairwise' is supported, got {self.mode!r}")
 
 
 @dataclass
@@ -109,6 +139,7 @@ class ModelConfig:
         Optional mapping of attribute name → group label for positional
         encodings (attention model only).
     """
+
     architecture: str = "addition"
     d_embed: int = 64
     d_model: int = 128
@@ -150,6 +181,7 @@ class TrainingConfig:
     attention_log_every_n_epochs:
         Epochs between attention heatmap logs.
     """
+
     loss_name: str = "distance_regression"
     loss_kwargs: dict[str, Any] = field(default_factory=dict)
     lr: float = 1e-3
@@ -176,6 +208,7 @@ class EvaluationConfig:
     n_linear_probe_epochs:
         Epochs for training the linear probe head.
     """
+
     run_downstream: bool = True
     downstream_tasks: list[str] = field(
         default_factory=lambda: ["mode_share", "departure_time", "chain_length"]
@@ -198,6 +231,7 @@ class ExperimentConfig:
     data, model, training, evaluation:
         Sub-configurations.
     """
+
     name: str = "experiment"
     seed: int = 42
     output_dir: str = "outputs"
@@ -210,6 +244,7 @@ class ExperimentConfig:
 # ---------------------------------------------------------------------------
 # Loader
 # ---------------------------------------------------------------------------
+
 
 def load_config(path: str | Path) -> ExperimentConfig:
     """Load and validate an experiment config from a YAML file.
@@ -234,15 +269,32 @@ def load_config(path: str | Path) -> ExperimentConfig:
         raw = yaml.safe_load(f)
 
     raw = raw or {}
+    data_raw = dict(raw.get("data", {}))
 
-    data = DataConfig(**{k: v for k, v in raw.get("data", {}).items()
-                         if k in DataConfig.__dataclass_fields__})
-    model = ModelConfig(**{k: v for k, v in raw.get("model", {}).items()
-                           if k in ModelConfig.__dataclass_fields__})
-    training = TrainingConfig(**{k: v for k, v in raw.get("training", {}).items()
-                                 if k in TrainingConfig.__dataclass_fields__})
-    evaluation = EvaluationConfig(**{k: v for k, v in raw.get("evaluation", {}).items()
-                                     if k in EvaluationConfig.__dataclass_fields__})
+    data = DataConfig(
+        **{k: v for k, v in data_raw.items() if k in DataConfig.__dataclass_fields__}
+    )
+    model = ModelConfig(
+        **{
+            k: v
+            for k, v in raw.get("model", {}).items()
+            if k in ModelConfig.__dataclass_fields__
+        }
+    )
+    training = TrainingConfig(
+        **{
+            k: v
+            for k, v in raw.get("training", {}).items()
+            if k in TrainingConfig.__dataclass_fields__
+        }
+    )
+    evaluation = EvaluationConfig(
+        **{
+            k: v
+            for k, v in raw.get("evaluation", {}).items()
+            if k in EvaluationConfig.__dataclass_fields__
+        }
+    )
 
     cfg = ExperimentConfig(
         name=raw.get("name", "experiment"),

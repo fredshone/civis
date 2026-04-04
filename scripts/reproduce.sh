@@ -17,6 +17,13 @@
 #                   Default: 3
 # BASE_CONFIG       YAML config used as the template for ablation sweeps.
 #                   Default: experiments/configs/attention_2layer.yaml
+# INCLUDE_LAZY_BASELINE
+#                   When set to 1, include the lazy pairwise baseline
+#                   config in Step 1.
+#                   Default: 0
+#
+# The lazy baseline uses the CUDA-capable composite distance path when the
+# config requests data.distance_device: cuda.
 #
 # The script is idempotent: each stage is skipped if its outputs already exist,
 # so interrupted runs can be resumed.
@@ -32,10 +39,7 @@ OUTPUT_DIR="${OUTPUT_DIR:-outputs}"
 RESULTS_DIR="${RESULTS_DIR:-results}"
 ABLATION_SEEDS="${ABLATION_SEEDS:-3}"
 BASE_CONFIG="${BASE_CONFIG:-experiments/configs/attention_2layer.yaml}"
-
-ACTIVITIES_PATH="${DATA_DIR}/activities.parquet"
-ATTRIBUTES_PATH="${DATA_DIR}/attributes.parquet"
-DIST_CACHE="${OUTPUT_DIR}/distance_matrix.npy"
+INCLUDE_LAZY_BASELINE="${INCLUDE_LAZY_BASELINE:-0}"
 
 echo "========================================================"
 echo " civis — Attribute Embedding Reproducibility Pipeline"
@@ -45,44 +49,19 @@ echo "  OUTPUT_DIR     = ${OUTPUT_DIR}"
 echo "  RESULTS_DIR    = ${RESULTS_DIR}"
 echo "  ABLATION_SEEDS = ${ABLATION_SEEDS}"
 echo "  BASE_CONFIG    = ${BASE_CONFIG}"
+echo "  LAZY           = ${INCLUDE_LAZY_BASELINE}"
 echo ""
 
 mkdir -p "${OUTPUT_DIR}" "${RESULTS_DIR}"
 
 # ---------------------------------------------------------------------------
-# Step 1 — Pre-compute composite distance matrix (cached)
+# Step 1 — Baseline experiments (one per YAML config)
+# Feature caches, candidate indices, and lazy pair-distance caches are
+# reused per experiment by the runner.
 # ---------------------------------------------------------------------------
 
 echo "------------------------------------------------------------"
-echo "Step 1: Schedule distance matrix"
-echo "------------------------------------------------------------"
-
-if [ -f "${DIST_CACHE}" ]; then
-    echo "  Cached distance matrix found at ${DIST_CACHE} — skipping."
-else
-    echo "  Computing pairwise composite distance matrix …"
-    uv run python - <<EOF
-import numpy as np
-from distances.composite import pairwise_composite_distance
-from distances.data import load_activities
-import pathlib
-
-out = pathlib.Path("${DIST_CACHE}")
-out.parent.mkdir(parents=True, exist_ok=True)
-acts = load_activities("${ACTIVITIES_PATH}")
-pids, D = pairwise_composite_distance(acts)
-np.save(out, D)
-print(f"  Saved distance matrix {D.shape} → {out}")
-EOF
-fi
-
-# ---------------------------------------------------------------------------
-# Step 2 — Baseline experiments (one per YAML config)
-# ---------------------------------------------------------------------------
-
-echo ""
-echo "------------------------------------------------------------"
-echo "Step 2: Baseline experiments"
+echo "Step 1: Baseline experiments"
 echo "------------------------------------------------------------"
 
 BASELINE_CONFIGS=(
@@ -93,6 +72,10 @@ BASELINE_CONFIGS=(
     "experiments/configs/film.yaml"
 )
 
+if [ "${INCLUDE_LAZY_BASELINE}" = "1" ]; then
+    BASELINE_CONFIGS+=("experiments/configs/attention_2layer_lazy.yaml")
+fi
+
 for cfg in "${BASELINE_CONFIGS[@]}"; do
     # Extract experiment name from the yaml (first `name:` line)
     exp_name=$(grep -m1 '^name:' "${cfg}" | awk '{print $2}')
@@ -102,40 +85,31 @@ for cfg in "${BASELINE_CONFIGS[@]}"; do
         echo "  ${exp_name}: already complete — skipping."
     else
         echo "  Running ${exp_name} …"
-        uv run python experiments/run.py "${cfg}"
+        uv run civis run "${cfg}" --data-dir "${DATA_DIR}"
     fi
 done
 
 # ---------------------------------------------------------------------------
-# Step 3 — Full ablation sweep
+# Step 2 — Full ablation sweep
 # ---------------------------------------------------------------------------
 
 echo ""
 echo "------------------------------------------------------------"
-echo "Step 3: Ablation sweep (${ABLATION_SEEDS} seeds each)"
+echo "Step 2: Ablation sweep (${ABLATION_SEEDS} seeds each)"
 echo "------------------------------------------------------------"
 
-uv run python - <<EOF
-from experiments.ablations import AblationRunner, ALL_ABLATIONS
-from experiments.configs import load_config
-
-base_cfg = load_config("${BASE_CONFIG}")
-runner = AblationRunner(
-    base_config=base_cfg,
-    ablation_configs=ALL_ABLATIONS,
-    output_base_dir="${OUTPUT_DIR}/ablations",
-)
-runner.run_all(n_seeds=${ABLATION_SEEDS})
-print("Ablation sweep complete.")
-EOF
+uv run civis ablate "${BASE_CONFIG}" \
+    --data-dir "${DATA_DIR}" \
+    --output-dir "${OUTPUT_DIR}/ablations" \
+    --seeds "${ABLATION_SEEDS}"
 
 # ---------------------------------------------------------------------------
-# Step 4 — Generate report (tables, findings, RESULTS.md)
+# Step 3 — Generate report (tables, findings, RESULTS.md)
 # ---------------------------------------------------------------------------
 
 echo ""
 echo "------------------------------------------------------------"
-echo "Step 4: Report generation"
+echo "Step 3: Report generation"
 echo "------------------------------------------------------------"
 
 # Determine the best experiment directory for UMAP (prefer attention_2layer)

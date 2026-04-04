@@ -12,6 +12,8 @@ discrete
 continuous
     Numeric columns (Int32 or Float64).  Normalised to [0, 1] using
     min-max statistics learned during ``fit``; null values map to 0.0.
+    For each continuous attribute, a parallel discrete ``{attr_name}_is_known``
+    attribute is also emitted (vocab: ["unknown", "known"]).
 
 Public API
 ----------
@@ -28,7 +30,7 @@ default_attribute_configs() -> list[AttributeConfig]
 from __future__ import annotations
 
 import pickle
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
@@ -56,9 +58,11 @@ class AttributeEncoder:
 
     def __init__(self, configs: list[AttributeConfig]) -> None:
         self.configs = configs
-        self._vocab: dict[str, list[str]] = {}        # discrete attr -> sorted vocab (index 0 = unknown)
-        self._min: dict[str, float] = {}              # continuous attr -> min
-        self._max: dict[str, float] = {}              # continuous attr -> max
+        self._vocab: dict[str, list[str]] = (
+            {}
+        )  # discrete attr -> sorted vocab (index 0 = unknown)
+        self._min: dict[str, float] = {}  # continuous attr -> min
+        self._max: dict[str, float] = {}  # continuous attr -> max
         self._fitted = False
 
     # ------------------------------------------------------------------
@@ -83,9 +87,7 @@ class AttributeEncoder:
             col = df[cfg.name]
             if cfg.kind == "discrete":
                 # Collect unique non-null values; sort for reproducibility
-                unique_vals = sorted(
-                    v for v in col.drop_nulls().unique().to_list()
-                )
+                unique_vals = sorted(v for v in col.drop_nulls().unique().to_list())
                 # index 0 is reserved for unknown/missing
                 self._vocab[cfg.name] = ["unknown"] + unique_vals
             else:
@@ -101,6 +103,9 @@ class AttributeEncoder:
                         vmax = vmin + 1.0
                     self._min[cfg.name] = vmin
                     self._max[cfg.name] = vmax
+                # Create vocab for the parallel is_known flag
+                is_known_name = f"{cfg.name}_is_known"
+                self._vocab[is_known_name] = ["unknown", "known"]
         self._fitted = True
         return self
 
@@ -137,8 +142,7 @@ class AttributeEncoder:
                     continue
                 val_to_idx = {v: i for i, v in enumerate(vocab)}
                 indices = [
-                    val_to_idx.get(v, 0) if v is not None else 0
-                    for v in col.to_list()
+                    val_to_idx.get(v, 0) if v is not None else 0 for v in col.to_list()
                 ]
                 out[cfg.name] = torch.tensor(indices, dtype=torch.int64)
             else:
@@ -146,12 +150,18 @@ class AttributeEncoder:
                 vmax = self._max.get(cfg.name, 1.0)
                 values = col.cast(pl.Float64).to_list()
                 normed = [
-                    float(np.clip((v - vmin) / (vmax - vmin), 0.0, 1.0))
-                    if v is not None
-                    else 0.0
+                    (
+                        float(np.clip((v - vmin) / (vmax - vmin), 0.0, 1.0))
+                        if v is not None
+                        else 0.0
+                    )
                     for v in values
                 ]
                 out[cfg.name] = torch.tensor(normed, dtype=torch.float32)
+                # Emit parallel is_known flag: index 1 for known, index 0 for unknown
+                is_known_indices = [1 if v is not None else 0 for v in values]
+                is_known_name = f"{cfg.name}_is_known"
+                out[is_known_name] = torch.tensor(is_known_indices, dtype=torch.int64)
         return out
 
     # ------------------------------------------------------------------
@@ -214,16 +224,37 @@ class AttributeEncoder:
 # Default configuration
 # ---------------------------------------------------------------------------
 
+
 def default_attribute_configs() -> list[AttributeConfig]:
     """Return configs covering all standard foundata attribute columns."""
     discrete_attrs = [
-        "sex", "dwelling", "ownership", "disability", "education", "can_wfh",
-        "occupation", "race", "has_licence", "relationship", "employment",
-        "country", "source", "year", "month", "day", "hh_zone", "rain",
+        "sex",
+        "dwelling",
+        "ownership",
+        "disability",
+        "education",
+        "can_wfh",
+        "occupation",
+        "race",
+        "has_licence",
+        "relationship",
+        "employment",
+        "country",
+        "source",
+        "year",
+        "month",
+        "day",
+        "hh_zone",
+        "rain",
     ]
     continuous_attrs = [
-        "age", "hh_size", "vehicles", "hh_income",
-        "access_egress_distance", "max_temp_c", "avg_speed",
+        "age",
+        "hh_size",
+        "vehicles",
+        "hh_income",
+        "access_egress_distance",
+        "max_temp_c",
+        "avg_speed",
     ]
     configs: list[AttributeConfig] = []
     configs += [AttributeConfig(name=n, kind="discrete") for n in discrete_attrs]

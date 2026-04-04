@@ -9,6 +9,7 @@ from torch.utils.data import DataLoader
 
 from datasets.dataset import (
     HardNegativeSampler,
+    LazyPairwiseDataset,
     ScheduleEmbeddingDataset,
     SparseDistanceMatrix,
     collate_fn,
@@ -20,6 +21,7 @@ from datasets.masking import AttributeMasker
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _make_distance_matrix(n: int, seed: int = 0) -> np.ndarray:
     rng = np.random.default_rng(seed)
     raw = rng.random((n, n)).astype(np.float64)
@@ -30,8 +32,8 @@ def _make_distance_matrix(n: int, seed: int = 0) -> np.ndarray:
 
 def _make_attributes(n: int) -> dict[str, torch.Tensor]:
     return {
-        "sex":     torch.randint(0, 3, (n,)),
-        "age":     torch.rand(n),
+        "sex": torch.randint(0, 3, (n,)),
+        "age": torch.rand(n),
         "country": torch.randint(0, 5, (n,)),
     }
 
@@ -39,6 +41,7 @@ def _make_attributes(n: int) -> dict[str, torch.Tensor]:
 # ---------------------------------------------------------------------------
 # SparseDistanceMatrix
 # ---------------------------------------------------------------------------
+
 
 class TestSparseDistanceMatrix:
     def test_from_dense_shape(self):
@@ -99,6 +102,7 @@ class TestSparseDistanceMatrix:
 # ScheduleEmbeddingDataset — pairwise mode
 # ---------------------------------------------------------------------------
 
+
 class TestPairwiseDataset:
     @pytest.fixture()
     def dataset(self):
@@ -138,8 +142,7 @@ class TestPairwiseDataset:
         for idx in range(n):
             _, _, dist = ds[idx]
             assert any(
-                abs(dist.item() - D[idx, j]) < 1e-5
-                for j in range(n) if j != idx
+                abs(dist.item() - D[idx, j]) < 1e-5 for j in range(n) if j != idx
             )
 
     def test_masker_applied(self):
@@ -158,6 +161,7 @@ class TestPairwiseDataset:
 # ScheduleEmbeddingDataset — triplet mode
 # ---------------------------------------------------------------------------
 
+
 class TestTripletDataset:
     @pytest.fixture()
     def dataset(self):
@@ -170,7 +174,8 @@ class TestTripletDataset:
         np.fill_diagonal(D, 0.0)
         D = (D + D.T) / 2
         return ScheduleEmbeddingDataset(
-            attrs, D,
+            attrs,
+            D,
             mode="triplet",
             positive_threshold=0.2,
             negative_threshold=0.5,
@@ -183,16 +188,16 @@ class TestTripletDataset:
     def test_positive_distance_below_threshold(self, dataset):
         for idx in range(6):
             _, _, _, d_ap, _ = dataset[idx]
-            assert d_ap.item() < 0.2 + 1e-5, (
-                f"Positive distance {d_ap.item()} >= threshold 0.2"
-            )
+            assert (
+                d_ap.item() < 0.2 + 1e-5
+            ), f"Positive distance {d_ap.item()} >= threshold 0.2"
 
     def test_negative_distance_above_threshold(self, dataset):
         for idx in range(6):
             _, _, _, _, d_an = dataset[idx]
-            assert d_an.item() > 0.5 - 1e-5, (
-                f"Negative distance {d_an.item()} <= threshold 0.5"
-            )
+            assert (
+                d_an.item() > 0.5 - 1e-5
+            ), f"Negative distance {d_an.item()} <= threshold 0.5"
 
     def test_distance_tensors_are_scalar(self, dataset):
         _, _, _, d_ap, d_an = dataset[0]
@@ -209,7 +214,9 @@ class TestTripletDataset:
         D = (D + D.T) / 2
         masker = AttributeMasker({"sex": 1.0})
         ds = ScheduleEmbeddingDataset(
-            attrs, D, masker=masker,
+            attrs,
+            D,
+            masker=masker,
             mode="triplet",
             positive_threshold=0.2,
             negative_threshold=0.5,
@@ -223,6 +230,7 @@ class TestTripletDataset:
 # ---------------------------------------------------------------------------
 # SparseDistanceMatrix with dataset
 # ---------------------------------------------------------------------------
+
 
 class TestSparseWithDataset:
     def test_pairwise_with_sparse_matrix(self):
@@ -238,8 +246,158 @@ class TestSparseWithDataset:
 
 
 # ---------------------------------------------------------------------------
+# LazyPairwiseDataset
+# ---------------------------------------------------------------------------
+
+
+class TestLazyPairwiseDataset:
+    def test_getitem_returns_pairwise_sample(self):
+        class L1Metric:
+            def score_pairs_batch(self, features, pairs, index=None):
+                matrix = features["matrix"]
+                left = matrix[pairs[:, 0]]
+                right = matrix[pairs[:, 1]]
+                return np.sum(np.abs(left - right), axis=1)
+
+        n = 10
+        attrs = _make_attributes(n)
+        global_idx = np.arange(n, dtype=np.int64)
+        matrix = np.random.default_rng(0).random((n, 4)).astype(np.float64)
+        metric_features = {"matrix": matrix}
+
+        ds = LazyPairwiseDataset(
+            attributes=attrs,
+            global_indices=global_idx,
+            metric=L1Metric(),
+            metric_features=metric_features,
+            candidate_index=None,
+            masker=None,
+        )
+
+        a_i, a_j, d = ds[0]
+        assert isinstance(a_i, dict)
+        assert isinstance(a_j, dict)
+        assert isinstance(d, torch.Tensor)
+        assert d.shape == ()
+
+    def test_distance_device_cpu_keeps_numpy_features(self):
+        class DeviceAwareMetric:
+            def __init__(self):
+                self.to_calls: list[str] = []
+
+            def to(self, device: str):
+                self.to_calls.append(device)
+                return self
+
+            def score_pairs_batch(self, features, pairs, index=None):
+                assert isinstance(features["matrix"], np.ndarray)
+                matrix = features["matrix"]
+                left = matrix[pairs[:, 0]]
+                right = matrix[pairs[:, 1]]
+                return np.sum(np.abs(left - right), axis=1)
+
+        n = 6
+        attrs = _make_attributes(n)
+        global_idx = np.arange(n, dtype=np.int64)
+        matrix = np.random.default_rng(3).random((n, 4)).astype(np.float64)
+        metric = DeviceAwareMetric()
+
+        ds = LazyPairwiseDataset(
+            attributes=attrs,
+            global_indices=global_idx,
+            metric=metric,
+            metric_features={"matrix": matrix},
+            distance_device="cpu",
+        )
+
+        _ = ds[0]
+        assert metric.to_calls == []
+
+    def test_masker_is_applied(self):
+        class L1Metric:
+            def score_pairs_batch(self, features, pairs, index=None):
+                matrix = features["matrix"]
+                left = matrix[pairs[:, 0]]
+                right = matrix[pairs[:, 1]]
+                return np.sum(np.abs(left - right), axis=1)
+
+        n = 8
+        attrs = _make_attributes(n)
+        global_idx = np.arange(n, dtype=np.int64)
+        matrix = np.random.default_rng(1).random((n, 3)).astype(np.float64)
+        masker = AttributeMasker({"sex": 1.0})
+        ds = LazyPairwiseDataset(
+            attributes=attrs,
+            global_indices=global_idx,
+            metric=L1Metric(),
+            metric_features={"matrix": matrix},
+            masker=masker,
+        )
+
+        a_i, a_j, _ = ds[0]
+        assert a_i["sex"].item() == 0
+        assert a_j["sex"].item() == 0
+
+    def test_global_index_length_must_match_attributes(self):
+        class DummyMetric:
+            def score_pairs_batch(self, features, pairs, index=None):
+                return np.zeros(len(pairs), dtype=np.float64)
+
+        n = 5
+        attrs = _make_attributes(n)
+        with pytest.raises(ValueError, match="global_indices length"):
+            LazyPairwiseDataset(
+                attributes=attrs,
+                global_indices=np.arange(n - 1),
+                metric=DummyMetric(),
+                metric_features={},
+            )
+
+    def test_distance_cache_reuses_computed_pairs(self, monkeypatch):
+        class CountingMetric:
+            def __init__(self):
+                self.calls = 0
+
+            def score_pairs_batch(self, features, pairs, index=None):
+                self.calls += 1
+                matrix = features["matrix"]
+                left = matrix[pairs[:, 0]]
+                right = matrix[pairs[:, 1]]
+                return np.sum(np.abs(left - right), axis=1)
+
+        n = 2
+        attrs = _make_attributes(n)
+        global_idx = np.arange(n, dtype=np.int64)
+        matrix = np.random.default_rng(2).random((n, 3)).astype(np.float64)
+        metric = CountingMetric()
+        shared_cache: dict[tuple[int, int], float] = {}
+
+        ds = LazyPairwiseDataset(
+            attributes=attrs,
+            global_indices=global_idx,
+            metric=metric,
+            metric_features={"matrix": matrix},
+            distance_cache=shared_cache,
+        )
+
+        # Pre-fill cache for pair (0,1) and force sampled j=1.
+        key = (0, 1)
+        pair = np.array([[0, 1]], dtype=np.int32)
+        d1 = metric.score_pairs_batch({"matrix": matrix}, pair)[0]
+        shared_cache[key] = float(d1)
+        calls_after_first = metric.calls
+
+        monkeypatch.setattr(np.random, "randint", lambda low, high=None: 1)
+        _ = ds[0]
+        calls_after_second = metric.calls
+
+        assert calls_after_second == calls_after_first
+
+
+# ---------------------------------------------------------------------------
 # collate_fn
 # ---------------------------------------------------------------------------
+
 
 class TestCollateFn:
     def test_pairwise_collate(self):
@@ -264,7 +422,9 @@ class TestCollateFn:
         batch = next(iter(dl))
         attrs_i_batch = batch[0]
         for key, tensor in attrs_i_batch.items():
-            assert tensor.shape[0] == 3, f"{key}: expected batch_size=3, got {tensor.shape}"
+            assert (
+                tensor.shape[0] == 3
+            ), f"{key}: expected batch_size=3, got {tensor.shape}"
 
     def test_triplet_collate(self):
         n = 12
@@ -275,7 +435,8 @@ class TestCollateFn:
         np.fill_diagonal(D, 0.0)
         D = (D + D.T) / 2
         ds = ScheduleEmbeddingDataset(
-            attrs, D,
+            attrs,
+            D,
             mode="triplet",
             positive_threshold=0.2,
             negative_threshold=0.5,
@@ -300,6 +461,7 @@ class TestCollateFn:
 # ---------------------------------------------------------------------------
 # HardNegativeSampler (basic)
 # ---------------------------------------------------------------------------
+
 
 class TestHardNegativeSampler:
     def test_refresh_raises_before_call(self):

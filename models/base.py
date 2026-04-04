@@ -42,6 +42,7 @@ from datasets.encoding import AttributeConfig, AttributeEncoder
 # Config
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class AttributeEmbedderConfig:
     """Configuration for attribute embedding models.
@@ -142,6 +143,7 @@ class AttributeEmbedderConfig:
 # Shared embedding layers
 # ---------------------------------------------------------------------------
 
+
 class DiscreteEmbedding(nn.Module):
     """Per-attribute lookup tables for discrete attributes.
 
@@ -159,10 +161,12 @@ class DiscreteEmbedding(nn.Module):
 
     def __init__(self, vocab_sizes: dict[str, int], d_embed: int) -> None:
         super().__init__()
-        self.embeddings = nn.ModuleDict({
-            name: nn.Embedding(vocab_size, d_embed)
-            for name, vocab_size in vocab_sizes.items()
-        })
+        self.embeddings = nn.ModuleDict(
+            {
+                name: nn.Embedding(vocab_size, d_embed)
+                for name, vocab_size in vocab_sizes.items()
+            }
+        )
         # Zero-initialise the unknown token for each attribute
         with torch.no_grad():
             for emb in self.embeddings.values():
@@ -193,6 +197,10 @@ class ContinuousProjection(nn.Module):
     Shared across all continuous attributes so they occupy the same embedding
     space as discrete tokens.
 
+    When an ``is_known`` flag is provided indicating unknown values, the
+    output embedding is zeroed for those samples (matching the zero-initialised
+    unknown token for discrete attributes).
+
     Parameters
     ----------
     d_embed:
@@ -208,25 +216,35 @@ class ContinuousProjection(nn.Module):
             nn.Linear(d_embed, d_embed),
         )
 
-    def forward(self, values: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, values: torch.Tensor, is_known: torch.Tensor | None = None
+    ) -> torch.Tensor:
         """Project a batch of scalar values.
 
         Parameters
         ----------
         values:
             Float tensor of shape ``(batch,)`` with values in ``[0, 1]``.
+        is_known:
+            Optional bool tensor of shape ``(batch,)`` indicating which values
+            are known (True) vs unknown (False).  Unknown values produce
+            zero embeddings.
 
         Returns
         -------
         torch.Tensor
             Shape ``(batch, d_embed)``.
         """
-        return self.net(values.unsqueeze(-1))
+        out = self.net(values.unsqueeze(-1))
+        if is_known is not None:
+            out = out * is_known.unsqueeze(-1).float()
+        return out
 
 
 # ---------------------------------------------------------------------------
 # Abstract base class
 # ---------------------------------------------------------------------------
+
 
 class BaseAttributeEmbedder(ABC, nn.Module):
     """Abstract base class for attribute embedding models.
@@ -247,7 +265,8 @@ class BaseAttributeEmbedder(ABC, nn.Module):
 
         # Only process attributes that have usable embedding layers
         self._active_attribute_configs: list[AttributeConfig] = [
-            cfg for cfg in config.attribute_configs
+            cfg
+            for cfg in config.attribute_configs
             if (cfg.kind == "discrete" and cfg.name in config.vocab_sizes)
             or cfg.kind == "continuous"
         ]
@@ -291,9 +310,7 @@ class BaseAttributeEmbedder(ABC, nn.Module):
             if attributes
             else torch.device("cpu")
         )
-        batch_size: int = (
-            next(iter(attributes.values())).shape[0] if attributes else 1
-        )
+        batch_size: int = next(iter(attributes.values())).shape[0] if attributes else 1
 
         token_list: list[torch.Tensor] = []
         mask_list: list[torch.Tensor] = []
@@ -312,8 +329,17 @@ class BaseAttributeEmbedder(ABC, nn.Module):
             else:  # continuous
                 if name in attributes:
                     values = attributes[name].to(device)
-                    token = self.continuous_projection(values)
-                    is_unknown = values == 0.0
+                    # Check for parallel is_known flag if available
+                    is_known_name = f"{name}_is_known"
+                    if is_known_name in attributes:
+                        is_known_indices = attributes[is_known_name].to(device)
+                        is_known_bool = is_known_indices == 1  # index 1 means known
+                    else:
+                        is_known_bool = None
+                    token = self.continuous_projection(values, is_known=is_known_bool)
+                    is_unknown = (
+                        values == 0.0 if is_known_bool is None else ~is_known_bool
+                    )
                 else:
                     values = torch.zeros(batch_size, dtype=torch.float32, device=device)
                     token = self.continuous_projection(values)
@@ -328,7 +354,7 @@ class BaseAttributeEmbedder(ABC, nn.Module):
             return tokens, mask
 
         tokens = torch.stack(token_list, dim=1)  # (batch, n_attrs, d_embed)
-        mask = torch.stack(mask_list, dim=1)      # (batch, n_attrs) bool
+        mask = torch.stack(mask_list, dim=1)  # (batch, n_attrs) bool
         return tokens, mask
 
     @abstractmethod

@@ -301,6 +301,15 @@ class GeometryAnalyser:
                 for i, j in zip(i_idx, j_idx)
             ])
 
+        if np.std(emb_dists) < 1e-8 or np.std(sched_dists) < 1e-8:
+            import warnings
+            warnings.warn(
+                "rank_correlation: constant input detected (embeddings may have "
+                "collapsed). Returning nan.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return float("nan")
         corr, _ = spearmanr(emb_dists, sched_dists)
         return float(corr)
 
@@ -336,12 +345,18 @@ class GeometryAnalyser:
         n = len(self.test_pids)
         max_k = max(k_values)
 
+        # Need at least 2 points to compute neighbours
+        if n < 2:
+            return {k: float("nan") for k in k_values}
+
+        max_k_eff = min(max_k, n - 1)
+
         # kNN in embedding space
-        nn_emb = NearestNeighbors(n_neighbors=max_k + 1, metric="euclidean")
+        nn_emb = NearestNeighbors(n_neighbors=max_k_eff + 1, metric="euclidean")
         nn_emb.fit(self._embeddings)
         _, emb_indices = nn_emb.kneighbors(self._embeddings)
         # emb_indices[i] includes i itself at position 0; drop it
-        emb_indices = emb_indices[:, 1:]  # (N, max_k)
+        emb_indices = emb_indices[:, 1:]  # (N, max_k_eff)
 
         # kNN in schedule space (from precomputed matrix)
         # argsort each row, exclude diagonal
@@ -350,6 +365,9 @@ class GeometryAnalyser:
         results: dict[int, float] = {}
         for k in k_values:
             k_eff = min(k, n - 1)
+            if k_eff == 0:
+                results[k] = float("nan")
+                continue
             overlaps = []
             emb_k = emb_indices[:, :k_eff]
             sched_k = sched_sorted[:, :k_eff]
@@ -405,12 +423,13 @@ class GeometryAnalyser:
         proj = pca.fit_transform(emb).ravel()  # (N,)
 
         # Per-source-pair Wasserstein distances
+        _MIN_GROUP = 5
         per_pair: dict[str, float] = {}
         for i, sa in enumerate(unique_sources):
             for sb in unique_sources[i + 1:]:
                 mask_a = sources == sa
                 mask_b = sources == sb
-                if mask_a.sum() == 0 or mask_b.sum() == 0:
+                if mask_a.sum() < _MIN_GROUP or mask_b.sum() < _MIN_GROUP:
                     continue
                 dist = float(wasserstein_distance(proj[mask_a], proj[mask_b]))
                 per_pair[f"{sa}_vs_{sb}"] = dist
@@ -470,6 +489,8 @@ class GeometryAnalyser:
         rng = np.random.default_rng(self.config.seed)
         n = len(self.test_pids)
         n_s = min(n_samples, n)
+        if n_s < 3:
+            return float("nan")
         idx = rng.choice(n, size=n_s, replace=False)
 
         emb = self._embeddings[idx]
@@ -648,6 +669,18 @@ class GeometryAnalyser:
 
         return figs
 
+    @staticmethod
+    def _fmt(v: float | None, fmt: str = ".4f") -> str:
+        """Format a possibly-None or NaN metric value for markdown."""
+        if v is None:
+            return "N/A"
+        try:
+            if np.isnan(v):
+                return "undefined (constant input)"
+        except (TypeError, ValueError):
+            pass
+        return format(v, fmt)
+
     def _write_markdown(self, results: dict[str, Any], out_dir: Path) -> None:
         au = results["alignment_uniformity"]
         rc = results["rank_correlation"]
@@ -658,25 +691,25 @@ class GeometryAnalyser:
         lines = [
             "# Geometry Analysis Report\n",
             "## Alignment / Uniformity\n",
-            f"- Alignment: {au.get('alignment')}\n",
-            f"- Uniformity: {au.get('uniformity'):.4f}\n\n",
+            f"- Alignment: {self._fmt(au.get('alignment'))}\n",
+            f"- Uniformity: {self._fmt(au.get('uniformity'))}\n\n",
             "## Rank Correlation\n",
-            f"- Spearman ρ (embedding vs schedule distance): **{rc:.4f}**\n\n",
+            f"- Spearman ρ (embedding vs schedule distance): **{self._fmt(rc)}**\n\n",
             "## Neighbourhood Overlap\n",
         ]
         for k, v in sorted(no.items()):
-            lines.append(f"- k={k}: {v:.4f}\n")
+            lines.append(f"- k={k}: {self._fmt(v)}\n")
         lines += [
             "\n## Source Separation\n",
-            f"- Mean Wasserstein: {ss['mean_wasserstein']:.4f}\n",
-            f"- Source accuracy (lower = better): {ss['source_accuracy']:.4f}\n",
+            f"- Mean Wasserstein: {self._fmt(ss['mean_wasserstein'])}\n",
+            f"- Source accuracy (lower = better): {self._fmt(ss['source_accuracy'])}\n",
             "\n### Per-source-pair Wasserstein\n",
         ]
         for pair, dist in ss["per_source_pair"].items():
-            lines.append(f"- {pair}: {dist:.4f}\n")
+            lines.append(f"- {pair}: {self._fmt(dist)}\n")
         lines += [
             "\n## CKA with Schedule Kernel\n",
-            f"- CKA: **{cka:.4f}**\n\n",
+            f"- CKA: **{self._fmt(cka)}**\n\n",
             "## Plots\n",
             "![t-SNE](tsne.png)\n",
             "![Distance scatter](distance_scatter.png)\n",

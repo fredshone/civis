@@ -1,0 +1,30 @@
+name: attention_2layer_lazy
+seed: 42
+output_dir: outputs
+
+data:
+  mode: pairwise
+  distance_device: cuda
+  timing_resolution: 10
+  lazy_distance_cache_file: lazy_distance_cache.npz
+  lazy_max_cached_pairs: 500000
+  distance_weights:
+    participation: 0.3333333333
+    sequence: 0.3333333333
+    timing: 0.3333333334
+
+model:
+  architecture: attention
+  d_embed: 64
+  d_model: 128
+  dropout: 0.1
+  n_heads: 4
+  n_layers: 2
+  use_cls_token: true
+  pooling: cls
+
+training:
+  loss_name: distance_regression
+  lr: 1.0e-3
+  max_epochs: 100
+  warmup_steps: 1000

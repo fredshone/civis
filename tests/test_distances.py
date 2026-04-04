@@ -25,6 +25,7 @@ from distances.composite import composite_distance
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _vec(*fractions: float) -> np.ndarray:
     """Build a participation vector with the given values (length 9, padded with 0)."""
     v = np.zeros(9, dtype=np.float64)
@@ -36,6 +37,7 @@ def _vec(*fractions: float) -> np.ndarray:
 # ---------------------------------------------------------------------------
 # participation_distance
 # ---------------------------------------------------------------------------
+
 
 class TestParticipationDistance:
     def test_identical_schedules_distance_zero(self):
@@ -55,10 +57,10 @@ class TestParticipationDistance:
 
     def test_partial_overlap(self):
         # Both spend time in home (index 0) but differ in remainder
-        v1 = _vec(0.5, 0.5)           # 50% home, 50% work
+        v1 = _vec(0.5, 0.5)  # 50% home, 50% work
         v2 = np.zeros(9, dtype=np.float64)
-        v2[0] = 0.5                    # 50% home
-        v2[2] = 0.5                    # 50% education
+        v2[0] = 0.5  # 50% home
+        v2[2] = 0.5  # 50% education
         d = participation_distance(v1, v2)
         assert 0.0 < d < 1.0
         assert d == pytest.approx(0.5)
@@ -96,6 +98,7 @@ class TestParticipationDistance:
 # ---------------------------------------------------------------------------
 # pairwise_participation_distance
 # ---------------------------------------------------------------------------
+
 
 class TestPairwiseParticipationDistance:
     def _sample_matrix(self, n: int = 5) -> np.ndarray:
@@ -143,6 +146,7 @@ class TestPairwiseParticipationDistance:
 # edit_distance
 # ---------------------------------------------------------------------------
 
+
 class TestEditDistance:
     def test_identical_sequences_distance_zero(self):
         seq = ["home", "work", "home"]
@@ -166,7 +170,7 @@ class TestEditDistance:
         assert edit_distance(s1, s2) == pytest.approx(1.0)
 
     def test_different_lengths(self):
-        s1 = ["home", "work", "home"]           # len 3
+        s1 = ["home", "work", "home"]  # len 3
         s2 = ["home", "work", "leisure", "home"]  # len 4
         d = edit_distance(s1, s2)
         assert 0.0 < d < 1.0
@@ -203,12 +207,15 @@ class TestEditDistance:
 
     def test_semantic_cost_identical_gives_zero(self):
         seq = ["home", "work", "leisure", "home"]
-        assert edit_distance(seq, seq, cost_matrix=DEFAULT_COST_MATRIX) == pytest.approx(0.0)
+        assert edit_distance(
+            seq, seq, cost_matrix=DEFAULT_COST_MATRIX
+        ) == pytest.approx(0.0)
 
 
 # ---------------------------------------------------------------------------
 # pairwise_sequence_distance
 # ---------------------------------------------------------------------------
+
 
 class TestPairwiseSequenceDistance:
     def _sample_seqs(self) -> list[list[str]]:
@@ -253,6 +260,7 @@ class TestPairwiseSequenceDistance:
 # timing_distance
 # ---------------------------------------------------------------------------
 
+
 class TestTimingDistance:
     def _row(self, pattern: list[int], t: int = 12) -> np.ndarray:
         """Build a time-use row of length t from a repeating pattern."""
@@ -293,16 +301,22 @@ class TestActivityTimingDistance:
     def test_neither_has_activity_distance_zero(self):
         r1 = np.zeros(10, dtype=np.int32)
         r2 = np.zeros(10, dtype=np.int32)
-        assert activity_timing_distance(r1, r2, activity_type_idx=1) == pytest.approx(0.0)
+        assert activity_timing_distance(r1, r2, activity_type_idx=1) == pytest.approx(
+            0.0
+        )
 
     def test_one_has_activity_distance_one(self):
         r1 = np.array([1] * 5 + [0] * 5, dtype=np.int32)
         r2 = np.zeros(10, dtype=np.int32)
-        assert activity_timing_distance(r1, r2, activity_type_idx=1) == pytest.approx(1.0)
+        assert activity_timing_distance(r1, r2, activity_type_idx=1) == pytest.approx(
+            1.0
+        )
 
     def test_same_timing_distance_zero(self):
         r = np.array([0, 1, 1, 0], dtype=np.int32)
-        assert activity_timing_distance(r, r.copy(), activity_type_idx=1) == pytest.approx(0.0)
+        assert activity_timing_distance(
+            r, r.copy(), activity_type_idx=1
+        ) == pytest.approx(0.0)
 
     def test_shifted_timing_positive(self):
         # Activity 1 at start vs. end
@@ -346,9 +360,7 @@ class TestPairwiseTimingDistance:
         D = pairwise_timing_distance(m)
         for i in range(len(m)):
             for j in range(len(m)):
-                assert D[i, j] == pytest.approx(
-                    timing_distance(m[i], m[j]), abs=1e-12
-                )
+                assert D[i, j] == pytest.approx(timing_distance(m[i], m[j]), abs=1e-12)
 
     def test_all_identical_distance_zero(self):
         row = np.zeros(20, dtype=np.int32)
@@ -375,13 +387,18 @@ class TestPairwiseActivityTimingDistance:
 # composite_distance
 # ---------------------------------------------------------------------------
 
+
 class TestCompositeDistance:
     def _make_inputs(self):
         rng = np.random.default_rng(99)
-        raw1 = rng.random(9); part1 = raw1 / raw1.sum()
-        raw2 = rng.random(9); part2 = raw2 / raw2.sum()
-        seq1 = ["home", "work", "home"]
-        seq2 = ["home", "education", "leisure", "home"]
+        raw1 = rng.random(9)
+        part1 = raw1 / raw1.sum()
+        raw2 = rng.random(9)
+        part2 = raw2 / raw2.sum()
+        seq1 = np.zeros(81, dtype=np.float64)
+        seq2 = np.zeros(81, dtype=np.float64)
+        seq1[[0, 10, 20]] = 1 / 3
+        seq2[[5, 22, 40]] = 1 / 3
         t1 = np.zeros(144, dtype=np.int32)
         t2 = np.ones(144, dtype=np.int32)
         return part1, part2, seq1, seq2, t1, t2
@@ -393,8 +410,10 @@ class TestCompositeDistance:
 
     def test_identical_inputs_distance_zero(self):
         rng = np.random.default_rng(42)
-        raw = rng.random(9); part = raw / raw.sum()
-        seq = ["home", "work", "home"]
+        raw = rng.random(9)
+        part = raw / raw.sum()
+        seq = np.zeros(81, dtype=np.float64)
+        seq[0] = 1.0
         t = np.zeros(144, dtype=np.int32)
         d = composite_distance(part, part, seq, seq, t, t)
         assert d == pytest.approx(0.0)
@@ -403,13 +422,16 @@ class TestCompositeDistance:
         part1, part2, seq1, seq2, t1, t2 = self._make_inputs()
         # Equal weights (1,1,1) should give same result as (1/3, 1/3, 1/3)
         d1 = composite_distance(part1, part2, seq1, seq2, t1, t2, weights=(1, 1, 1))
-        d2 = composite_distance(part1, part2, seq1, seq2, t1, t2, weights=(1/3, 1/3, 1/3))
+        d2 = composite_distance(
+            part1, part2, seq1, seq2, t1, t2, weights=(1 / 3, 1 / 3, 1 / 3)
+        )
         assert d1 == pytest.approx(d2)
 
     def test_zero_weight_ignores_component(self):
         part1, part2, seq1, seq2, t1, t2 = self._make_inputs()
         # With only timing weight, result should equal timing_distance
         from distances.timing import timing_distance as td
+
         d_comp = composite_distance(part1, part2, seq1, seq2, t1, t2, weights=(0, 0, 1))
         d_time = td(t1, t2)
         assert d_comp == pytest.approx(d_time)

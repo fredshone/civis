@@ -34,10 +34,10 @@ from distances.data import ACTIVITY_TYPES
 # ---------------------------------------------------------------------------
 
 _REDUCED: dict[frozenset, float] = {
-    frozenset({"work", "education"}): 0.5,
-    frozenset({"leisure", "visit"}): 0.5,
-    frozenset({"leisure", "shop"}): 0.5,
-    frozenset({"escort", "other"}): 0.5,
+    # frozenset({"work", "education"}): 0.5,
+    # frozenset({"leisure", "visit"}): 0.5,
+    # frozenset({"leisure", "shop"}): 0.5,
+    # frozenset({"escort", "other"}): 0.5,
 }
 
 

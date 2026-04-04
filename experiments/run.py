@@ -8,7 +8,7 @@ Usage
 
 The script:
 1. Loads the experiment config.
-2. Loads and/or computes the pairwise schedule distance matrix (cached to disk).
+2. Builds or reuses feature caches and the pairwise schedule distance matrix.
 3. Splits data into train / val / test by person index.
 4. Fits an :class:`~datasets.encoding.AttributeEncoder` and encodes attributes.
 5. Builds a :class:`~datasets.masking.AttributeMasker`.
@@ -37,20 +37,25 @@ from pathlib import Path
 import numpy as np
 import polars as pl
 import torch
-import lightning as _pl
-from lightning.pytorch.loggers import TensorBoardLogger
+import pytorch_lightning as _pl
+from pytorch_lightning.loggers import TensorBoardLogger
 from torch.utils.data import DataLoader
 
 from datasets.dataset import (
-    HardNegativeSampler,
-    ScheduleEmbeddingDataset,
-    SparseDistanceMatrix,
+    LazyPairwiseDataset,
     collate_fn,
 )
 from datasets.encoding import AttributeEncoder, default_attribute_configs
 from datasets.masking import AttributeMasker
-from distances.composite import pairwise_composite_distance
+from distances import build_schedule_features
 from distances.data import load_activities, load_attributes
+from distances.metric_plugins import (
+    CompositeDistance,
+    GPUCompositeDistance,
+    ParticipationDistance,
+    TimingDistance,
+    TwoGramDistance,
+)
 from experiments.configs import ExperimentConfig, load_config
 from models.base import AttributeEmbedderConfig, BaseAttributeEmbedder
 from models.registry import build_model
@@ -68,9 +73,11 @@ from training.trainer import (
 # Internal result type
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class _TrainingResult:
     """All state produced by a completed training run."""
+
     model: BaseAttributeEmbedder
     encoder: AttributeEncoder
     masker: AttributeMasker
@@ -79,7 +86,8 @@ class _TrainingResult:
     train_idx: np.ndarray
     val_idx: np.ndarray
     test_idx: np.ndarray
-    D: np.ndarray          # full pairwise N×N distance matrix
+    pids: list[str]  # person IDs in global activities order
+    D: np.ndarray | None  # optional full pairwise N×N distance matrix
     output_path: Path
     n_params: int
 
@@ -88,32 +96,47 @@ class _TrainingResult:
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _sample_val_pairs(
-    attrs: dict[str, torch.Tensor],
-    D_dense: np.ndarray,
-    n_pairs: int,
-    seed: int,
-) -> tuple[dict, dict, torch.Tensor]:
-    """Sample a fixed set of val pairs for held-out rank-correlation evaluation."""
-    rng = np.random.default_rng(seed)
-    N = D_dense.shape[0]
-    idx_i = rng.integers(0, N, size=n_pairs)
-    idx_j = rng.integers(0, N, size=n_pairs)
-    # Ensure no self-pairs
-    same = idx_i == idx_j
-    idx_j[same] = (idx_j[same] + 1) % N
 
-    distances = torch.tensor(
-        D_dense[idx_i, idx_j].astype(np.float32), dtype=torch.float32
-    )
-    attrs_i = {k: v[idx_i] for k, v in attrs.items()}
-    attrs_j = {k: v[idx_j] for k, v in attrs.items()}
-    return attrs_i, attrs_j, distances
+def _load_distance_cache(path: Path) -> dict[tuple[int, int], float]:
+    """Load a persisted lazy pair-distance cache.
+
+    Cache format is a compressed ``npz`` with:
+    - ``pairs``: int32 array shape (M, 2)
+    - ``distances``: float32 array shape (M,)
+    """
+    if not path.exists():
+        return {}
+    data = np.load(path, allow_pickle=False)
+    if "pairs" not in data or "distances" not in data:
+        return {}
+    pairs = data["pairs"]
+    distances = data["distances"]
+    cache: dict[tuple[int, int], float] = {}
+    for (i, j), d in zip(pairs, distances):
+        ii = int(i)
+        jj = int(j)
+        key = (ii, jj) if ii < jj else (jj, ii)
+        cache[key] = float(d)
+    return cache
+
+
+def _save_distance_cache(
+    cache: dict[tuple[int, int], float],
+    path: Path,
+) -> None:
+    """Persist lazy pair-distance cache as compressed ``npz``."""
+    if not cache:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pairs = np.array(list(cache.keys()), dtype=np.int32)
+    distances = np.array(list(cache.values()), dtype=np.float32)
+    np.savez_compressed(path, pairs=pairs, distances=distances)
 
 
 # ---------------------------------------------------------------------------
 # Core training pipeline (shared by both public entry points)
 # ---------------------------------------------------------------------------
+
 
 def _run_training(config: ExperimentConfig) -> _TrainingResult:
     """Run the full training pipeline and return all artefacts.
@@ -137,23 +160,91 @@ def _run_training(config: ExperimentConfig) -> _TrainingResult:
     print(f"  {N} persons, {len(activities_df)} activity records")
 
     # ------------------------------------------------------------------
-    # 2. Distance matrix (compute or load from cache)
+    # 2. Distance setup (lazy composite only)
     # ------------------------------------------------------------------
-    dist_cache = output_path / "distance_matrix.npy"
-    if dist_cache.exists():
-        print(f"Loading cached distance matrix from {dist_cache}")
-        D = np.load(dist_cache)
-    else:
-        print("Computing pairwise composite distance matrix ...")
-        D = pairwise_composite_distance(
-            activities_df, weights=config.data.distance_weights
+    feature_store_dir = output_path / "feature_store"
+    lazy_cache_path = output_path / config.data.lazy_distance_cache_file
+    D: np.ndarray | None = None
+    pids: list[str] = sorted(activities_df["pid"].unique().to_list())
+    metric = None
+    metric_features = None
+    metric_index = None
+    lazy_distance_cache: dict[tuple[int, int], float] | None = None
+
+    if config.data.mode != "pairwise":
+        raise ValueError("Only mode='pairwise' is supported")
+
+    print("Building/loading feature store for lazy composite pairwise scoring ...")
+    requested_distance_device = config.data.distance_device
+    distance_device = (
+        requested_distance_device
+        if requested_distance_device == "cpu" or torch.cuda.is_available()
+        else "cpu"
+    )
+    if requested_distance_device != "cpu" and distance_device != "cuda":
+        print("  CUDA unavailable; using CPU distance scoring for this run")
+
+    if distance_device == "cuda":
+        metric = GPUCompositeDistance(
+            components=[
+                ParticipationDistance(),
+                TwoGramDistance(),
+                TimingDistance(resolution=config.data.timing_resolution),
+            ],
+            weights=config.data.distance_weights,
+            normalize_weights=True,
+            device=distance_device,
         )
-        np.save(dist_cache, D)
-        print(f"  Saved to {dist_cache}")
+    else:
+        metric = CompositeDistance(
+            components=[
+                ParticipationDistance(),
+                TwoGramDistance(),
+                TimingDistance(resolution=config.data.timing_resolution),
+            ],
+            weights=config.data.distance_weights,
+            normalize_weights=True,
+        )
+    schedule_features = build_schedule_features(
+        activities_df,
+        feature_dir=feature_store_dir,
+        timing_resolution=config.data.timing_resolution,
+        overwrite=False,
+    )
+    metric_features = {
+        "pids": schedule_features.pids,
+        "components": [
+            {
+                "pids": schedule_features.pids,
+                "matrix": schedule_features.participation,
+            },
+            {
+                "pids": schedule_features.pids,
+                "matrix": schedule_features.sequence_2grams,
+            },
+            {"pids": schedule_features.pids, "matrix": schedule_features.timing},
+        ],
+    }
+    pids = metric_features["pids"]
+    metric_index = metric.build_candidate_index(metric_features)
+    lazy_distance_cache = _load_distance_cache(lazy_cache_path)
+    if lazy_distance_cache:
+        print(f"  Loaded lazy pair-distance cache: {len(lazy_distance_cache):,} pairs")
 
     # ------------------------------------------------------------------
-    # 3. Train / val / test split
+    # 3. Align attribute rows to metric pid order, then split
     # ------------------------------------------------------------------
+    attr_pids: list[str] = attributes_df["pid"].to_list()
+    metric_pos = {pid: i for i, pid in enumerate(pids)}
+    try:
+        attr_to_metric_idx = np.array(
+            [metric_pos[pid] for pid in attr_pids], dtype=np.int64
+        )
+    except KeyError as exc:
+        raise ValueError(
+            f"pid {exc.args[0]!r} from attributes not found in activities-derived metric space"
+        )
+
     rng = np.random.default_rng(config.seed)
     indices = rng.permutation(N)
     n_train = int(N * config.data.train_fraction)
@@ -161,7 +252,9 @@ def _run_training(config: ExperimentConfig) -> _TrainingResult:
     train_idx = indices[:n_train]
     val_idx = indices[n_train : n_train + n_val]
     test_idx = indices[n_train + n_val :]
-    print(f"  Split: {len(train_idx)} train / {len(val_idx)} val / {len(test_idx)} test")
+    print(
+        f"  Split: {len(train_idx)} train / {len(val_idx)} val / {len(test_idx)} test"
+    )
 
     # ------------------------------------------------------------------
     # 4. Encode attributes
@@ -183,35 +276,48 @@ def _run_training(config: ExperimentConfig) -> _TrainingResult:
     )
 
     # ------------------------------------------------------------------
-    # 6. Distance matrices
+    # 6. Distance supervision and fixed validation pairs
     # ------------------------------------------------------------------
-    train_D_sparse = SparseDistanceMatrix.from_dense(
-        D[np.ix_(train_idx, train_idx)], k=config.data.sparse_k
-    )
-    val_D_dense = D[np.ix_(val_idx, val_idx)]
-
-    # ------------------------------------------------------------------
-    # 7. Fixed validation pairs
-    # ------------------------------------------------------------------
-    val_pairs = _sample_val_pairs(
-        val_attrs, val_D_dense, config.data.n_val_pairs, config.data.val_pairs_seed
+    rng_pairs = np.random.default_rng(config.data.val_pairs_seed)
+    n_val = len(val_idx)
+    vi = rng_pairs.integers(0, n_val, size=config.data.n_val_pairs)
+    vj = rng_pairs.integers(0, n_val, size=config.data.n_val_pairs)
+    same = vi == vj
+    vj[same] = (vj[same] + 1) % n_val
+    global_i = attr_to_metric_idx[val_idx[vi]]
+    global_j = attr_to_metric_idx[val_idx[vj]]
+    pair_arr = np.stack([global_i, global_j], axis=1).astype(np.int32)
+    d_val = metric.score_pairs_batch(metric_features, pair_arr, metric_index)
+    val_pairs = (
+        {k: v[vi] for k, v in val_attrs.items()},
+        {k: v[vj] for k, v in val_attrs.items()},
+        torch.tensor(d_val.astype(np.float32), dtype=torch.float32),
     )
 
     # ------------------------------------------------------------------
     # 8. Datasets and DataLoaders
     # ------------------------------------------------------------------
-    train_dataset = ScheduleEmbeddingDataset(
+    train_dataset = LazyPairwiseDataset(
         attributes=train_attrs,
-        distance_matrix=train_D_sparse,
+        global_indices=attr_to_metric_idx[train_idx],
+        metric=metric,
+        metric_features=metric_features,
+        candidate_index=metric_index,
         masker=masker,
-        mode=config.data.mode,
-        positive_threshold=config.data.positive_threshold,
-        negative_threshold=config.data.negative_threshold,
+        distance_cache=lazy_distance_cache,
+        max_cached_pairs=config.data.lazy_max_cached_pairs,
+        distance_device=distance_device,
     )
-    val_dataset = ScheduleEmbeddingDataset(
+    val_dataset = LazyPairwiseDataset(
         attributes=val_attrs,
-        distance_matrix=val_D_dense,
-        mode=config.data.mode,
+        global_indices=attr_to_metric_idx[val_idx],
+        metric=metric,
+        metric_features=metric_features,
+        candidate_index=metric_index,
+        masker=None,
+        distance_cache=lazy_distance_cache,
+        max_cached_pairs=config.data.lazy_max_cached_pairs,
+        distance_device=distance_device,
     )
 
     train_loader = DataLoader(
@@ -262,9 +368,7 @@ def _run_training(config: ExperimentConfig) -> _TrainingResult:
     # ------------------------------------------------------------------
     # 11. Hard negative sampler
     # ------------------------------------------------------------------
-    hard_negative_sampler: HardNegativeSampler | None = None
-    if config.data.mode in ("pairwise", "triplet"):
-        hard_negative_sampler = HardNegativeSampler(k=50)
+    hard_negative_sampler = None
 
     # ------------------------------------------------------------------
     # 12. Collapse monitor — source labels from training split
@@ -350,6 +454,13 @@ def _run_training(config: ExperimentConfig) -> _TrainingResult:
     with open(output_path / "config.json", "w") as _fh:
         _json.dump(_asdict(config), _fh, indent=2)
 
+    if lazy_distance_cache is not None:
+        _save_distance_cache(lazy_distance_cache, lazy_cache_path)
+        print(
+            f"Saved lazy pair-distance cache: {len(lazy_distance_cache):,} pairs "
+            f"-> {lazy_cache_path}"
+        )
+
     return _TrainingResult(
         model=embedding_trainer.model,
         encoder=encoder,
@@ -359,6 +470,7 @@ def _run_training(config: ExperimentConfig) -> _TrainingResult:
         train_idx=train_idx,
         val_idx=val_idx,
         test_idx=test_idx,
+        pids=pids,
         D=D,
         output_path=output_path,
         n_params=n_params,
@@ -368,6 +480,7 @@ def _run_training(config: ExperimentConfig) -> _TrainingResult:
 # ---------------------------------------------------------------------------
 # Public entry points
 # ---------------------------------------------------------------------------
+
 
 def run_experiment(config_path: str | Path) -> None:
     """Run a full training experiment from a YAML config file.
@@ -444,17 +557,18 @@ def run_experiment_returning_metrics(
 
     train_attributes = result.attributes_df[result.train_idx.tolist()]
     test_attributes = result.attributes_df[result.test_idx.tolist()]
-    train_activities = result.activities_df.filter(
-        pl.col("pid").is_in(train_pid_set)
-    )
-    test_activities = result.activities_df.filter(
-        pl.col("pid").is_in(test_pid_set)
-    )
+    train_activities = result.activities_df.filter(pl.col("pid").is_in(train_pid_set))
+    test_activities = result.activities_df.filter(pl.col("pid").is_in(test_pid_set))
 
     # ------------------------------------------------------------------
     # Intrinsic geometry analysis
     # ------------------------------------------------------------------
     try:
+        if result.D is None:
+            raise RuntimeError(
+                "Dense distance matrix unavailable (lazy composite-only backend); "
+                "skipping intrinsic geometry metrics"
+            )
         D_test = result.D[np.ix_(result.test_idx, result.test_idx)]
         analyser_cfg = GeometryAnalyserConfig(
             seed=config.seed,
@@ -493,7 +607,7 @@ def run_experiment_returning_metrics(
             metrics["intrinsic/uniformity"] = float(au["uniformity"])
 
         rc = geo_report.get("rank_correlation")
-        if rc is not None:
+        if rc is not None and not (isinstance(rc, float) and np.isnan(rc)):
             metrics["intrinsic/rank_correlation"] = float(rc)
 
         no = geo_report.get("neighbourhood_overlap", {})
@@ -503,9 +617,7 @@ def run_experiment_returning_metrics(
 
         ss = geo_report.get("source_separation", {})
         if "mean_wasserstein" in ss:
-            metrics["intrinsic/source_mean_wasserstein"] = float(
-                ss["mean_wasserstein"]
-            )
+            metrics["intrinsic/source_mean_wasserstein"] = float(ss["mean_wasserstein"])
         if "source_accuracy" in ss:
             metrics["intrinsic/source_accuracy"] = float(ss["source_accuracy"])
 

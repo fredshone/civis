@@ -19,8 +19,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import lightning as pl
-from lightning.pytorch.callbacks import ModelCheckpoint
+import pytorch_lightning as pl
+from pytorch_lightning.callbacks import ModelCheckpoint
 from scipy.stats import spearmanr
 from torch.utils.data import DataLoader, SubsetRandomSampler
 
@@ -143,24 +143,16 @@ class EmbeddingTrainer(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         if isinstance(self.loss_fn, SoftNearestNeighbourLoss):
-            attrs, dist_matrix = batch
+            attrs, dist_matrix, batch_indices = batch
             dist_matrix = dist_matrix.to(self.device)
-            # dist_matrix from collate is (B, N); we need (B, B) — select rows
-            # corresponding to anchor indices within the batch.
-            # For "single" mode, dist_matrix is (B, N_total).
-            # Gather the B×B sub-matrix for the batch.
+            batch_indices = batch_indices.to(self.device)
             attrs = {k: v.to(self.device) for k, v in attrs.items()}
             emb = self.model(attrs)
-            # When using single mode, dist_matrix is (B, N); we need (B, B).
-            # We index into the batch rows: for row b, take the distances to
-            # each other sample in the batch (identified by their position in
-            # the full dataset, which we don't track here).  As a practical
-            # approximation, use the dist_matrix as is if it is already (B, B),
-            # or take the first B columns if it is (B, N).
-            B = emb.shape[0]
-            if dist_matrix.shape[-1] != B:
-                dist_matrix = dist_matrix[:, :B]
-            loss, diag = self.loss_fn(emb, dist_matrix)
+            # dist_matrix is (B, N_total); batch_indices are the dataset indices
+            # of the B batch members.  Selecting those columns gives the exact
+            # (B, B) schedule-distance sub-matrix for this batch.
+            dist_bxb = dist_matrix[:, batch_indices]
+            loss, diag = self.loss_fn(emb, dist_bxb)
         else:
             attrs_i, attrs_j, distances = batch
             attrs_i = {k: v.to(self.device) for k, v in attrs_i.items()}
@@ -216,19 +208,18 @@ class EmbeddingTrainer(pl.LightningModule):
 
     def validation_step(self, batch, batch_idx):
         if isinstance(self.loss_fn, SoftNearestNeighbourLoss):
-            attrs, dist_matrix = batch
+            attrs, dist_matrix, batch_indices = batch
             dist_matrix = dist_matrix.to(self.device)
+            batch_indices = batch_indices.to(self.device)
             attrs = {k: v.to(self.device) for k, v in attrs.items()}
             emb = self.model(attrs)
-            B = emb.shape[0]
-            if dist_matrix.shape[-1] != B:
-                dist_matrix = dist_matrix[:, :B]
-            loss, _ = self.loss_fn(emb, dist_matrix)
+            dist_bxb = dist_matrix[:, batch_indices]
+            loss, _ = self.loss_fn(emb, dist_bxb)
             # For metrics accumulation, treat emb as both sides
             self.validation_step_outputs.append({
                 "emb_i": emb.detach(),
                 "emb_j": emb.detach(),
-                "distances": dist_matrix.diagonal().detach(),
+                "distances": dist_bxb.diagonal().detach(),
                 "loss": loss.detach(),
             })
         else:
@@ -286,64 +277,13 @@ class EmbeddingTrainer(pl.LightningModule):
                 hj = self.model(vj)
             ed = _pairwise_euclidean(hi, hj).cpu().numpy()
             sd = vd.cpu().numpy()
-            rho = spearmanr(ed, sd).statistic
-            self.log("val/rank_correlation", float(rho), prog_bar=True)
+            if np.std(ed) >= 1e-8 and np.std(sd) >= 1e-8:
+                rho = spearmanr(ed, sd).statistic
+                if not np.isnan(rho):
+                    self.log("val/rank_correlation", float(rho), prog_bar=True)
 
-        # Neighbourhood overlap at k=5 and k=20
-        for k in (5, 20):
-            overlap = self._neighbourhood_overlap(emb_i, emb_j, distances, k=k)
-            if overlap is not None:
-                self.log(f"val/neighbour_overlap_k{k}", overlap)
-
-    def _neighbourhood_overlap(
-        self,
-        emb_i: torch.Tensor,
-        emb_j: torch.Tensor,
-        distances: torch.Tensor,
-        k: int,
-    ) -> float | None:
-        """Fraction of k-NN in embedding space that are also k-NN in schedule space."""
-        valid = ~distances.isnan()
-        if valid.sum() < k + 1:
-            return None
-        ei = emb_i[valid].cpu()
-        ej = emb_j[valid].cpu()
-        sd = distances[valid].cpu()
-
-        all_emb = torch.cat([ei, ej], dim=0)  # (2M, d)
-        M = ei.shape[0]
-        N = all_emb.shape[0]
-        if N < k + 1:
-            return None
-
-        # Embedding-space k-NN for each of the 2M points
-        dists_emb = torch.cdist(all_emb, all_emb)   # (2M, 2M)
-        dists_emb.fill_diagonal_(float("inf"))
-        _, emb_knn = dists_emb.topk(k, dim=-1, largest=False)  # (2M, k)
-
-        # Schedule-space: reconstruct pairwise from paired distances
-        # We only have the M paired distances, so approximate using those
-        # Build (2M, 2M) schedule distance matrix (partial)
-        sched_full = torch.full((N, N), float("inf"))
-        for idx in range(M):
-            sched_full[idx, M + idx] = sd[idx]
-            sched_full[M + idx, idx] = sd[idx]
-        sched_full.fill_diagonal_(float("inf"))
-        _, sched_knn = sched_full.topk(k, dim=-1, largest=False)  # (2M, k)
-
-        # Overlap: only rows where we have at least k schedule neighbours
-        has_sched = (sched_full < float("inf")).sum(dim=-1) >= k
-        if has_sched.sum() == 0:
-            return None
-
-        overlaps = []
-        for i in range(N):
-            if not has_sched[i]:
-                continue
-            emb_set = set(emb_knn[i].tolist())
-            sched_set = set(sched_knn[i].tolist())
-            overlaps.append(len(emb_set & sched_set) / k)
-        return float(np.mean(overlaps)) if overlaps else None
+        # Neighbourhood overlap is only reported in post-training geometry analysis
+        # via GeometryAnalyser.neighbourhood_overlap, which uses the full N×N matrix.
 
     # ------------------------------------------------------------------
     # Optimiser
@@ -489,7 +429,7 @@ class CollapseMonitor(pl.Callback):
 
         if ratio > self.threshold:
             try:
-                from lightning.pytorch.loggers import TensorBoardLogger
+                from pytorch_lightning.loggers import TensorBoardLogger
                 if isinstance(trainer.logger, TensorBoardLogger):
                     trainer.logger.experiment.add_text(
                         "warning/collapse",
@@ -531,7 +471,7 @@ class AttentionLogger(pl.Callback):
             return
 
         try:
-            from lightning.pytorch.loggers import TensorBoardLogger
+            from pytorch_lightning.loggers import TensorBoardLogger
             if not isinstance(trainer.logger, TensorBoardLogger):
                 return
         except Exception:
